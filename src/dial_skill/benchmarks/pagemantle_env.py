@@ -421,13 +421,42 @@ def _iter_file_records(path: Path, max_rows: int = 5000) -> list[dict[str, Any]]
     return records
 
 
+def _group_warehouse_tables(files: list[Path], max_tables: int = 50) -> dict[str, tuple[str, str]]:
+    """Map logical table names -> (glob_or_file_path, suffix) safely for 10k-80k partitioned warehouse files."""
+    if not files:
+        return {}
+    if len(files) <= max_tables:
+        out: dict[str, tuple[str, str]] = {}
+        for f in files:
+            tbl = f.stem.replace("-", "_")
+            out[tbl] = (f.as_posix(), f.suffix.lower())
+        return out
+
+    # Partitioned warehouse (e.g. Snowflake 82k files / BigQuery 17k files): group by logical table dir
+    tables: dict[str, tuple[str, str]] = {}
+    for f in files:
+        suf = f.suffix.lower()
+        if suf not in (".parquet", ".csv", ".json", ".jsonl"):
+            continue
+        # Walk up past Hive-style partition folders (e.g., date=2025-01-01, year=2025, month=01)
+        table_dir = f.parent
+        while "=" in table_dir.name or table_dir.name.isdigit():
+            table_dir = table_dir.parent
+        tbl = table_dir.name.replace("-", "_")
+        if tbl and tbl not in tables:
+            tables[tbl] = (f"{table_dir.as_posix()}/**/*{suf}", suf)
+            if len(tables) >= max_tables:
+                break
+    return tables
+
+
 def _run_sql_on_service_files(files: list[Path], sql: str, limit: int = 50) -> list[dict[str, Any]]:
     """Execute a read-only SQL query against Snowflake/BigQuery parquet/csv/sqlite/duckdb files."""
     sql_clean = sql.strip().rstrip(";")
     if not sql_clean.lower().startswith(("select", "with", "show", "describe", "pragma")):
         raise ValueError("Only read-only SELECT/WITH/SHOW queries are permitted.")
 
-    # Prefer DuckDB if installed (supports parquet, csv, json, duckdb directly on disk)
+    # Prefer DuckDB if installed (supports partitioned globbed parquet/csv/json and .duckdb directly on disk)
     try:
         import duckdb  # type: ignore[import-not-found]
 
@@ -436,15 +465,19 @@ def _run_sql_on_service_files(files: list[Path], sql: str, limit: int = 50) -> l
             con = duckdb.connect(str(duckdb_files[0]), read_only=True)
         else:
             con = duckdb.connect(database=":memory:")
-            for f in files:
-                tbl = f.stem.replace("-", "_")
-                suf = f.suffix.lower()
+            for tbl, (glob_path, suf) in _group_warehouse_tables(files).items():
                 if suf == ".parquet":
-                    con.execute(f'CREATE OR REPLACE VIEW "{tbl}" AS SELECT * FROM read_parquet(\'{f.as_posix()}\')')
+                    con.execute(
+                        f'CREATE OR REPLACE VIEW "{tbl}" AS SELECT * FROM read_parquet(\'{glob_path}\', union_by_name=true)'
+                    )
                 elif suf == ".csv":
-                    con.execute(f'CREATE OR REPLACE VIEW "{tbl}" AS SELECT * FROM read_csv_auto(\'{f.as_posix()}\')')
+                    con.execute(
+                        f'CREATE OR REPLACE VIEW "{tbl}" AS SELECT * FROM read_csv_auto(\'{glob_path}\')'
+                    )
                 elif suf in (".json", ".jsonl"):
-                    con.execute(f'CREATE OR REPLACE VIEW "{tbl}" AS SELECT * FROM read_json_auto(\'{f.as_posix()}\')')
+                    con.execute(
+                        f'CREATE OR REPLACE VIEW "{tbl}" AS SELECT * FROM read_json_auto(\'{glob_path}\')'
+                    )
         cur = con.execute(sql_clean)
         cols = [c[0] for c in cur.description] if cur.description else []
         rows = [dict(zip(cols, r)) for r in cur.fetchmany(limit)]
@@ -464,11 +497,11 @@ def _run_sql_on_service_files(files: list[Path], sql: str, limit: int = 50) -> l
         finally:
             con.close()
 
-    # Load small CSV/JSON tables into transient SQLite for offline queries
+    # Load small CSV/JSON tables into transient SQLite for offline queries (capped at 30 files)
     con = sqlite3.connect(":memory:")
     con.row_factory = sqlite3.Row
     try:
-        for f in files:
+        for f in files[:30]:
             recs = _iter_file_records(f, max_rows=2000)
             if not recs:
                 continue
@@ -728,7 +761,7 @@ class PageMantleEnv:
 
         files = self._service_files.get(matched_service, [])
         if action == "list_tables":
-            return {"service": matched_service, "tables": [f.stem for f in files]}
+            return {"service": matched_service, "tables": sorted(_group_warehouse_tables(files).keys())}
 
         if action == "query_sql":
             if not files:
@@ -757,7 +790,7 @@ class PageMantleEnv:
             return {"service": service, "matches": []}
         tokens = [t for t in query.split() if len(t) >= 2]
         matches: list[dict[str, Any]] = []
-        for path in files:
+        for path in files[:200]:
             for rec in _iter_file_records(path, max_rows=3000):
                 hay = json.dumps(rec, ensure_ascii=False, default=str).lower()
                 if not tokens or all(tok in hay for tok in tokens) or query in hay:
