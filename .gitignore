@@ -1,0 +1,50 @@
+# ==============================================================================
+# Secrets & API Keys — NEVER commit to GitHub!
+# ==============================================================================
+JEV_API_KEY.txt
+OPENAI_KEY.txt
+*_KEY.txt
+*_key.txt
+*.key
+.env
+.env.*
+secrets/
+
+# ==============================================================================
+# Local Datasets, Caches & Experiment Outputs (Persisted on Google Drive)
+# ==============================================================================
+data/
+datasets/
+runs/
+outputs/
+cache/
+local_drive_mirror/
+external/
+*.sqlite
+*.sqlite3
+*.duckdb
+*.parquet
+
+# ==============================================================================
+# Python & Jupyter
+# ==============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# ==============================================================================
+# OS & IDE
+# ==============================================================================
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

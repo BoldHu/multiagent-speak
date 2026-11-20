@@ -1,0 +1,67 @@
+seed: 42
+default_mode: "pilot"
+
+when2speak:
+  dataset_id: "duke-trust-lab/When2Speak"
+  splits:
+    val_calib: 200
+    pilot: 400
+    main: 2000
+    full: -1
+  dialogue_judge_subset: 100
+  calibration:
+    lambda_grid: [0.5, 0.75, 1.0, 1.25, 1.5]
+    tau_dm_grid: [-0.10, -0.05, 0.0, 0.05, 0.10, 0.15, 0.20]
+
+pagemantle:
+  benchmark_repo: "https://github.com/deepnote/agent-initiative-benchmark.git"
+  dataset_repo: "deepnote/pagemantle-company-dataset"
+  splits:
+    official_count: 8
+    online_stream_count: 24
+    online_stream_action: 18
+    online_stream_traps: 6
+    online_waves: 3
+    eval_count: 32
+    eval_action: 22
+    eval_traps: 10
+    pilot_mini_eval_count: 8
+    pilot_mini_wave_count: 8
+
+pilot_go_nogo:
+  w2s_min_macro_f1: 0.62
+  w2s_min_delta_vs_direct: 0.08
+  w2s_max_fir: 0.12
+  w2s_max_mir: 0.45
+  pm_min_delta_vs_direct: 0.60
+  pm_min_silence_acc: 0.75
+  pm_max_timeout_rate: 0.125
+  triage_min_token_reduction: 0.40
+  triage_min_decisive_recall: 0.90
+  margin_min_gap: 0.20
+  margin_min_auroc: 0.78
+  dbcse_min_heldout_delta: -0.05
+
+ablations:
+  - id: "A1_no_jev_triage"
+    overrides: {ablation: {disable_triage: true}}
+  - id: "A2_openai_luna_triage"
+    overrides: {ablation: {triage_backend_override: "openai_fallback"}}
+  - id: "A3_asymmetric_evidence"
+    overrides: {ablation: {asymmetric_evidence: true}}
+  - id: "A4_advocate_only"
+    overrides: {ablation: {gate_mode: "advocate_only"}}
+  - id: "A4_skeptic_only"
+    overrides: {ablation: {gate_mode: "skeptic_only"}}
+  - id: "A4_single_combined"
+    overrides: {ablation: {gate_mode: "single_combined"}}
+  - id: "A5_binary_no_deescalation"
+    overrides: {ablation: {binary_only: true}}
+  - id: "A6_no_disagreement_u"
+    overrides: {ablation: {disable_disagreement_deesc: true}}
+  - id: "A7_no_skill_routing"
+    overrides: {ablation: {disable_skill_routing: true}}
+
+scaling:
+  lambda_pareto_sweep: [0.5, 0.75, 1.0, 1.25, 1.5]
+  model_tiers: ["luna", "terra"]

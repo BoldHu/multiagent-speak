@@ -1,0 +1,205 @@
+{
+  "version": 0,
+  "skills": {
+    "find": {
+      "name": "find",
+      "description": "Locate a specific fact, document, owner, past decision, or current ticket/account status across enterprise systems.",
+      "trigger_conditions": [
+        "Team explicitly asks where a doc, owner, past decision, or record lives and nobody has provided it.",
+        "Discussion stalls because participants lack a concrete factual lookup stored in Notion, Linear, Slack history, or CRM."
+      ],
+      "veto_conditions": [
+        "A teammate already shared the link, owner, or accurate answer in recent turns.",
+        "Participants are casually reminiscing or explicitly agreed to check it offline later."
+      ],
+      "channel_policy": {
+        "default_tier": "THREAD_BRIEF",
+        "max_tier": "THREAD_BRIEF",
+        "deescalation_rule": "Prefer THREAD_BRIEF; drop to DM_NUDGE if only one person asked casually."
+      },
+      "investigation_plan": [
+        "Search Notion docs and Slack history for the named artifact, decision, or owner.",
+        "Check Linear issues or HubSpot/Google Calendar if ownership, status, or meeting context is referenced."
+      ],
+      "max_tool_calls": 5,
+      "response_contract": "State the exact answer first, cite source ID/title/date, and avoid extra background commentary.",
+      "margin_offset": 0.0,
+      "deescalation_bias": 0.0
+    },
+    "explain": {
+      "name": "explain",
+      "description": "Clarify how an internal process, metric definition, billing rule, or technical mechanism works.",
+      "trigger_conditions": [
+        "Participants express confusion or hold conflicting mental models about an internal term, process, or business rule.",
+        "A misunderstanding of how a system works is about to misguide an upcoming task."
+      ],
+      "veto_conditions": [
+        "Participants are joking or speaking loosely without real operational confusion.",
+        "A domain expert in the channel is actively typing/explaining the same rule accurately."
+      ],
+      "channel_policy": {
+        "default_tier": "THREAD_BRIEF",
+        "max_tier": "CHANNEL_INTERVENE",
+        "deescalation_rule": "Use THREAD_BRIEF for single-user questions; CHANNEL_INTERVENE only if whole team is aligned on a wrong rule."
+      },
+      "investigation_plan": [
+        "Retrieve authoritative specification from Notion wikis and runbooks.",
+        "Cross-check actual implementation or config notes in Linear or Slack engineering threads."
+      ],
+      "max_tool_calls": 5,
+      "response_contract": "Give a crisp 2-3 sentence definition/mechanism backed by the authoritative Notion/Linear reference.",
+      "margin_offset": 0.0,
+      "deescalation_bias": 0.0
+    },
+    "analyze": {
+      "name": "analyze",
+      "description": "Combine and compare quantitative data from multiple sources to surface trends, metric changes, or operational patterns.",
+      "trigger_conditions": [
+        "Team is debating a metric shift, conversion drop, revenue change, or growth trend without hard cross-source numbers.",
+        "An important business decision hinges on joining data across analytics, billing, or warehouse tables."
+      ],
+      "veto_conditions": [
+        "Team is only doing early high-level brainstorming where approximate intuition is sufficient.",
+        "An analyst already committed to running the query and sharing a dashboard shortly."
+      ],
+      "channel_policy": {
+        "default_tier": "THREAD_BRIEF",
+        "max_tier": "CHANNEL_INTERVENE",
+        "deescalation_rule": "Deliver compact key figures in THREAD_BRIEF; escalate to CHANNEL_INTERVENE only for major unexpected metric anomalies."
+      },
+      "investigation_plan": [
+        "Run targeted SQL queries on Snowflake or BigQuery for the exact timeframe and cohort.",
+        "Cross-validate directional trends against PostHog, Google Analytics, Google Search Console, or Stripe."
+      ],
+      "max_tool_calls": 8,
+      "response_contract": "Lead with headline numbers (exact timeframe, delta, %), cite tables/sources, keep under 100 words.",
+      "margin_offset": 0.0,
+      "deescalation_bias": 0.0
+    },
+    "check": {
+      "name": "check",
+      "description": "Verify whether a specific claim, date, figure, or assumption stated in chat accurately matches source-of-truth records.",
+      "trigger_conditions": [
+        "A participant states a specific number, launch date, customer status, or contract fact that conflicts with source records.",
+        "Team is about to send external communications or commit to a plan relying on an unverified factual claim."
+      ],
+      "veto_conditions": [
+        "Verification confirms the stated claim is already accurate—stay SILENT instead of saying 'looks right!'.",
+        "Discrepancy is trivial rounding with zero operational consequence."
+      ],
+      "channel_policy": {
+        "default_tier": "THREAD_BRIEF",
+        "max_tier": "CHANNEL_INTERVENE",
+        "deescalation_rule": "Use DM_NUDGE if correcting a single person privately avoids embarrassment before external send; THREAD_BRIEF or CHANNEL_INTERVENE if group is acting on the error."
+      },
+      "investigation_plan": [
+        "Identify the primary system of record (Stripe for billing, HubSpot for CRM, Linear for dates/bugs, Snowflake for metrics).",
+        "Cross-check against a second system if discrepancies exist across departments."
+      ],
+      "max_tool_calls": 6,
+      "response_contract": "Politely state Claim vs. Verified Source Fact with exact record ID/timestamp, no lecturing.",
+      "margin_offset": 0.0,
+      "deescalation_bias": 0.0
+    },
+    "diagnose": {
+      "name": "diagnose",
+      "description": "Isolate the root cause of a technical, customer, billing, or pipeline failure and identify actionable remediation steps.",
+      "trigger_conditions": [
+        "A customer bug, login/SSO failure, billing error, or metric pipeline break is reported without a confirmed root cause.",
+        "Team is chasing a wrong hypothesis when logs, tickets, or account records reveal the real cause."
+      ],
+      "veto_conditions": [
+        "Root cause is already identified and an engineer is actively deploying the fix.",
+        "Symptom is a transient blip with no confirming evidence in enterprise tools."
+      ],
+      "channel_policy": {
+        "default_tier": "THREAD_BRIEF",
+        "max_tier": "CHANNEL_INTERVENE",
+        "deescalation_rule": "Use CHANNEL_INTERVENE for active customer-facing incidents; THREAD_BRIEF for isolated ticket triage."
+      },
+      "investigation_plan": [
+        "Check Linear issues and Slack incident/engineering channels for matching error signatures or recent deploys.",
+        "Inspect affected customer records in HubSpot, Stripe, PostHog, or Snowflake logs to isolate scope and root cause."
+      ],
+      "max_tool_calls": 8,
+      "response_contract": "Format as Root Cause -> Supporting Evidence (IDs/timestamps) -> Concrete Next Fix.",
+      "margin_offset": 0.0,
+      "deescalation_bias": 0.0
+    },
+    "decide": {
+      "name": "decide",
+      "description": "Compare competing options against concrete constraints and data to formulate a clear, reasoned recommendation.",
+      "trigger_conditions": [
+        "Team is deadlocked between concrete options or about to pick an option that violates known capacity, cost, or SLA constraints.",
+        "Relevant quantitative trade-offs exist across enterprise systems that the group has not synthesized."
+      ],
+      "veto_conditions": [
+        "Decision is a pure taste/subjective call or executive prerogative with no missing objective evidence.",
+        "Decision-maker already finalized the choice and moved to execution."
+      ],
+      "channel_policy": {
+        "default_tier": "THREAD_BRIEF",
+        "max_tier": "THREAD_BRIEF",
+        "deescalation_rule": "Keep recommendations humble and scoped to THREAD_BRIEF or DM_NUDGE to preserve human decision ownership."
+      },
+      "investigation_plan": [
+        "Gather hard constraints from Notion roadmaps, Linear workload, and Google Calendar deadlines.",
+        "Pull customer/revenue impact from HubSpot, Stripe, or Snowflake to rank options objectively."
+      ],
+      "max_tool_calls": 7,
+      "response_contract": "Present concise 2-option comparison with evidence-backed trade-offs and 1 clear recommendation.",
+      "margin_offset": 0.0,
+      "deescalation_bias": 0.0
+    },
+    "coordinate": {
+      "name": "coordinate",
+      "description": "Align cross-functional stakeholders, surface hidden cross-channel dependencies, and clarify ownership or handoffs.",
+      "trigger_conditions": [
+        "One team's timeline or announcement contradicts another team's plan/delay recorded in another channel, Linear, or Calendar.",
+        "Action items have stalled with unclear ownership or a forgotten stakeholder who must sign off."
+      ],
+      "veto_conditions": [
+        "Owners and timelines are already explicitly assigned and acknowledged by all parties.",
+        "Cross-team sync is already scheduled on Google Calendar with the right attendees."
+      ],
+      "channel_policy": {
+        "default_tier": "THREAD_BRIEF",
+        "max_tier": "CHANNEL_INTERVENE",
+        "deescalation_rule": "Use DM_NUDGE to gently remind a single owner; THREAD_BRIEF/CHANNEL_INTERVENE when two teams have an active schedule clash."
+      },
+      "investigation_plan": [
+        "Scan cross-department Slack channels, Linear sprint milestones, and Google Calendar events.",
+        "Identify exact owners and conflicting dates from Notion project briefs or HubSpot deal timelines."
+      ],
+      "max_tool_calls": 6,
+      "response_contract": "Name the exact misalignment, involved owners, verified dates/tickets, and one crisp coordination action.",
+      "margin_offset": 0.0,
+      "deescalation_bias": 0.0
+    },
+    "guard": {
+      "name": "guard",
+      "description": "Screen proposed actions, data shares, or access requests against internal security, privacy, permission, and compliance policies.",
+      "trigger_conditions": [
+        "A team member proposes sharing restricted PII, financial data, credentials, or granting access violating Notion security/compliance policy.",
+        "External disclosure or contract commitment conflicts with legal, billing, or access rules."
+      ],
+      "veto_conditions": [
+        "Action is already compliant or explicitly approved by authorized security/legal owner.",
+        "Hypothetical policy discussion with no imminent risky action."
+      ],
+      "channel_policy": {
+        "default_tier": "DM_NUDGE",
+        "max_tier": "THREAD_BRIEF",
+        "deescalation_rule": "DEFAULT TO DM_NUDGE to avoid public shaming or amplifying sensitive data; use THREAD_BRIEF only if urgent group-wide stop is needed."
+      },
+      "investigation_plan": [
+        "Locate exact security, privacy, or access-control policy in Notion.",
+        "Verify user role, customer tier, or contract clause in HubSpot, Stripe, or Slack policy announcements."
+      ],
+      "max_tool_calls": 5,
+      "response_contract": "Flag the specific policy clause neutrally, state the safe compliant alternative, and never repeat raw sensitive secrets.",
+      "margin_offset": 0.0,
+      "deescalation_bias": 0.35
+    }
+  }
+}
