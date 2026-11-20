@@ -62,7 +62,58 @@ def _create_mock_pagemantle_dataset(root: Path) -> Path:
 
 
 def test_when2speak_loader_stratified_sampling_and_zero_leakage(tmp_path: Path) -> None:
-    # Create synthetic local validation + test JSONLs matching ~13% SPEAK & 5 intervention types
+    # 1. Test official duke-trust-lab/When2Speak OpenAI chat schema (dialogue & token configs)
+    from dial_skill.benchmarks.when2speak import normalize_when2speak_rows
+
+    hf_dialogue_rows = [
+        {
+            "messages": [
+                {"role": "system", "content": "Decide when to speak or output >."},
+                {"role": "user", "content": "Speaker_0: Let's discuss the jazz concert timeline."},
+                {"role": "user", "content": "Speaker_1: Sounds good, I think it was in 1920."},
+                {"role": "assistant", "content": ">"},
+            ]
+        },
+        {
+            "messages": [
+                {"role": "system", "content": "Decide when to speak or output >."},
+                {"role": "user", "content": "Speaker_0: Let's discuss the jazz concert timeline."},
+                {"role": "user", "content": "Speaker_1: Sounds good, I think it was in 1920."},
+                {"role": "user", "content": "Speaker_2: Wait [AGENT], can you verify that year?"},
+                {"role": "assistant", "content": "Actually the first commercial jazz recording was in 1917."},
+            ]
+        },
+    ]
+    parsed_dlg = normalize_when2speak_rows(hf_dialogue_rows, split="validation")
+    assert len(parsed_dlg) == 2
+    assert parsed_dlg[0].label_speak is False
+    assert parsed_dlg[0].reference_response is None
+    assert parsed_dlg[1].label_speak is True
+    assert parsed_dlg[1].reference_response == "Actually the first commercial jazz recording was in 1917."
+    # System prompt stripped, speaker prefix parsed, and same opening turn groups into same conversation_id!
+    assert all(m.speaker != "system" for t in parsed_dlg for m in t.messages)
+    assert parsed_dlg[0].messages[0].speaker == "Speaker_0"
+    assert parsed_dlg[0].conversation_id == parsed_dlg[1].conversation_id
+
+    hf_token_rows = [
+        {
+            "messages": [
+                {"role": "user", "content": "Speaker_0: Quick question for [AGENT]."},
+                {"role": "assistant", "content": "<"},
+            ]
+        },
+        {
+            "messages": [
+                {"role": "user", "content": "Speaker_0: Thanks everyone, bye!"},
+                {"role": "assistant", "content": ">"},
+            ]
+        },
+    ]
+    parsed_tok = normalize_when2speak_rows(hf_token_rows, split="test")
+    assert parsed_tok[0].label_speak is True   # `<` = SPEAK in When2Speak
+    assert parsed_tok[1].label_speak is False  # `>` = SILENT in When2Speak
+
+    # 2. Test local validation + test JSONLs matching ~13% SPEAK & 5 intervention types
     types = ["clarification", "correction", "coordination", "suggestion", "alert"]
     for split, n_convs in [("validation", 25), ("test", 50)]:
         rows = []
@@ -76,7 +127,7 @@ def test_when2speak_loader_stratified_sampling_and_zero_leakage(tmp_path: Path) 
                         "conversation_id": cid,
                         "turn_index": t,
                         "messages": [{"speaker": f"u{k%2}", "text": f"Turn {k} in {cid}"} for k in range(t + 1)],
-                        "token": ">" if speak else "<",
+                        "token": "<" if speak else ">",
                         "intervention_type": itype,
                     }
                 )
