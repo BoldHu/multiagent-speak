@@ -279,6 +279,51 @@ def test_jev_client_success_caching_and_graceful_fallback(tmp_path: Path) -> Non
     meta = tc_fb.get_run_metadata()
     assert meta["fallback_count"] == 1
     assert meta["jev_circuit_open_reason"] is not None
+
+    # 3. Official typesafe_sdk nouls/choices/scores object schema & timeout fallback
+    from dial_skill.llm.jev_client import parse_jev_response_to_triage_item
+
+    sdk_obj = SimpleNamespace(
+        nouls={"decision_change": SimpleNamespace(noul=0.91)},
+        choices={
+            "stance": SimpleNamespace(
+                choice="defer_or_resolved_signal",
+                probabilities={"need_signal": 0.05, "defer_or_resolved_signal": 0.90, "scope_risk_signal": 0.02, "background_chatter": 0.03},
+                confidence=0.94,
+            ),
+            "skill_hint": SimpleNamespace(
+                choice="check",
+                probabilities={"check": 0.85, "none": 0.15},
+                confidence=0.88,
+            ),
+        },
+        scores={"urgency": SimpleNamespace(score=2.25, legend=["none", "low_async", "medium_thread", "high_immediate"])},
+    )
+    parsed_sdk = parse_jev_response_to_triage_item(sdk_obj, msg_id="m_sdk", backend="jev")
+    assert abs(parsed_sdk.p_decision_change - 0.91) < 1e-6
+    assert parsed_sdk.stance == "defer_or_resolved_signal"
+    assert parsed_sdk.skill_hint == "check"
+    assert abs(parsed_sdk.urgency_score - 0.75) < 1e-6  # 2.25 / 3.0 = 0.75
+    assert abs(parsed_sdk.confidence - 0.94) < 1e-6
+
+    # Hanging SDK call MUST time out via asyncio.wait_for and fall back gracefully to OpenAI Luna
+    class _HangingSDK:
+        async def system_one(self, **kwargs: Any) -> Any:
+            await asyncio.sleep(5.0)
+
+    fast_models_cfg = load_models_config()
+    tc_timeout = TriageClient(
+        models_cfg=fast_models_cfg,
+        cache=SQLiteAPICache(tmp_path / "jev_to_cache.sqlite"),
+        openai_client=oai_client,
+        luna_model="gpt-6-luna",
+        jev_api_key="fake-jev",
+        sdk_client=_HangingSDK(),
+    )
+    tc_timeout.models_cfg.jev.timeout_sec = -1.9  # effective wait_for timeout = 0.1s
+    to_item = asyncio.run(tc_timeout.score_message("#billing", [], msg))
+    assert to_item.backend == "openai_fallback"
+    assert tc_timeout.fallback_count == 1
     cache.close()
 
 

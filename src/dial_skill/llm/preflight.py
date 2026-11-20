@@ -154,7 +154,10 @@ async def run_preflight(
         item = await tc.score_message("#ops", [], probe_msg, backend_override="jev")
         jev_healthy = item.backend == "jev"
         if not jev_healthy:
-            notes.append("Jev probe fell back to OpenAI Luna; setting triage_backend='openai_fallback'.")
+            reason_note = "; ".join(tc.fallback_reasons[:2]) if tc.fallback_reasons else "unknown"
+            notes.append(
+                f"Jev probe fell back to OpenAI Luna ({reason_note}); setting triage_backend='openai_fallback'."
+            )
     except Exception as exc:
         notes.append(f"Jev health check failed: {type(exc).__name__}: {exc}")
 

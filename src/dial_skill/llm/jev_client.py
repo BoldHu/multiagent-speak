@@ -215,20 +215,27 @@ def parse_jev_response_to_triage_item(
     msg_id: str,
     backend: Literal["jev", "openai_fallback"] = "jev",
 ) -> TriageItem:
-    """Parse either TypeSafe SDK response object or raw JSON dict into canonical TriageItem."""
+    """Parse TypeSafe SDK response (nouls/choices/scores), REST answers dict, or OpenAI fallback JSON."""
+    nouls = _extract_attr_or_key(raw_resp, "nouls", default=None)
+    choices = _extract_attr_or_key(raw_resp, "choices", default=None)
+    scores = _extract_attr_or_key(raw_resp, "scores", default=None)
     answers = _extract_attr_or_key(raw_resp, "answers", "results", "output", default=raw_resp)
 
     # 1. decision_change (Noul)
-    dc_field = _extract_attr_or_key(answers, "decision_change", default=answers)
+    dc_field = _extract_attr_or_key(nouls, "decision_change", default=None) if nouls is not None else None
+    if dc_field is None:
+        dc_field = _extract_attr_or_key(answers, "decision_change", default=answers)
     p_chg = _extract_attr_or_key(
-        dc_field, "probability", "prob", "score", "value", "p_decision_change", default=0.5
+        dc_field, "noul", "probability", "prob", "score", "value", "p_decision_change", default=0.5
     )
     if isinstance(p_chg, bool):
         p_chg = 1.0 if p_chg else 0.0
     p_chg_f = _clamp01(float(p_chg))
 
     # 2. stance (Choice)
-    stance_field = _extract_attr_or_key(answers, "stance", default={})
+    stance_field = _extract_attr_or_key(choices, "stance", default=None) if choices is not None else None
+    if stance_field is None:
+        stance_field = _extract_attr_or_key(answers, "stance", default={})
     raw_stance_probs = _extract_attr_or_key(
         stance_field, "probabilities", "probs", "distribution", "scores", default=None
     )
@@ -246,7 +253,9 @@ def parse_jev_response_to_triage_item(
         stance_label = max(stance_probs.items(), key=lambda kv: kv[1])[0]
 
     # 3. skill_hint (Choice)
-    skill_field = _extract_attr_or_key(answers, "skill_hint", default={})
+    skill_field = _extract_attr_or_key(choices, "skill_hint", default=None) if choices is not None else None
+    if skill_field is None:
+        skill_field = _extract_attr_or_key(answers, "skill_hint", default={})
     raw_skill_probs = _extract_attr_or_key(
         skill_field, "probabilities", "probs", "distribution", "scores", default=None
     )
@@ -264,13 +273,21 @@ def parse_jev_response_to_triage_item(
         skill_label = max(skill_probs.items(), key=lambda kv: kv[1])[0]
 
     # 4. urgency (Score)
-    urg_field = _extract_attr_or_key(answers, "urgency", "urgency_score", default=0.0)
+    urg_field = _extract_attr_or_key(scores, "urgency", default=None) if scores is not None else None
+    if urg_field is None:
+        urg_field = _extract_attr_or_key(answers, "urgency", "urgency_score", default=0.0)
     urg_val = (
         urg_field
         if isinstance(urg_field, (int, float))
         else _extract_attr_or_key(urg_field, "score", "value", "probability", default=0.0)
     )
-    urg_f = _clamp01(float(urg_val or 0.0))
+    urg_num = float(urg_val or 0.0)
+    if urg_num > 1.0:
+        # Normalize rubric index scales (e.g. 0..3 for 4 urgency criteria) onto [0, 1]
+        legend = _extract_attr_or_key(urg_field, "legend", default=None)
+        max_level = max(1, (len(legend) - 1) if isinstance(legend, (list, dict)) and len(legend) > 1 else 3)
+        urg_num = urg_num / float(max_level)
+    urg_f = _clamp01(urg_num)
 
     # 5. confidence (optional calibrated confidence)
     conf_val = _extract_attr_or_key(
@@ -390,42 +407,81 @@ class TriageClient:
             self._fallback_client = OpenAILunaTriageFallback(client, self._luna_model, seed=self.seed)
         return self._fallback_client
 
+    def _build_sdk_client(self) -> Any | None:
+        """Instantiate AsyncTypeSafeClient (preferred) or TypeSafeClient with explicit timeout & short retry."""
+        if not self.jev_api_key:
+            return None
+        try:
+            import inspect
+            import typesafe_sdk  # type: ignore[import-not-found]
+        except Exception:
+            return None
+
+        client_cls = getattr(typesafe_sdk, "AsyncTypeSafeClient", None) or getattr(
+            typesafe_sdk, "TypeSafeClient", None
+        )
+        if client_cls is None:
+            return None
+
+        timeout_sec = float(self.models_cfg.jev.timeout_sec)
+        kwargs: dict[str, Any] = {"api_key": self.jev_api_key}
+        try:
+            sig = inspect.signature(client_cls.__init__)
+            params = sig.parameters
+            if "base_url" in params:
+                kwargs["base_url"] = self.models_cfg.jev.base_url
+            if "timeout" in params:
+                kwargs["timeout"] = timeout_sec
+            retry_cls = getattr(typesafe_sdk, "RetryPolicy", None)
+            if "retry" in params and retry_cls is not None:
+                try:
+                    kwargs["retry"] = retry_cls(max_retries=1, backoff_max=2.0)
+                except Exception:
+                    pass
+        except Exception:
+            kwargs["base_url"] = self.models_cfg.jev.base_url
+
+        try:
+            return client_cls(**kwargs)
+        except TypeError:
+            return client_cls(api_key=self.jev_api_key)
+
     async def _invoke_jev_backend(
         self,
         model: str,
         state_payload: dict[str, Any],
-    ) -> dict[str, Any]:
-        """Invoke Jev via injected/installed typesafe_sdk OR direct POST /v1/systemone."""
+    ) -> Any:
+        """Invoke Jev via injected/installed typesafe_sdk OR direct POST /v1/systemone with hard timeout."""
         questions = build_jev_triage_questions()
+        timeout_sec = float(self.models_cfg.jev.timeout_sec)
 
         # Path A: injected or installed TypeSafe SDK client
         sdk = self._sdk_client
         if sdk is None and self._http_client is None:
-            try:
-                from typesafe_sdk import TypeSafeClient  # type: ignore[import-not-found]
-
-                if self.jev_api_key:
-                    sdk = TypeSafeClient(
-                        api_key=self.jev_api_key,
-                        base_url=self.models_cfg.jev.base_url,
-                    )
-                    self._sdk_client = sdk
-            except Exception:
-                sdk = None
+            sdk = self._build_sdk_client()
+            self._sdk_client = sdk
 
         if sdk is not None:
             fn = getattr(sdk, "system_one", None) or getattr(sdk, "systemone", None)
             if fn is None:
                 raise RuntimeError("TypeSafe SDK client does not expose system_one method")
-            if asyncio.iscoroutinefunction(fn):
-                raw = await fn(state=state_payload, questions=questions, model=model)
-            else:
-                raw = await asyncio.to_thread(fn, state=state_payload, questions=questions, model=model)
+
+            async def _call_sdk(include_model: bool) -> Any:
+                call_kw: dict[str, Any] = {"state": state_payload, "questions": questions}
+                if include_model:
+                    call_kw["model"] = model
+                if asyncio.iscoroutinefunction(fn):
+                    return await fn(**call_kw)
+                return await asyncio.to_thread(fn, **call_kw)
+
+            try:
+                raw = await asyncio.wait_for(_call_sdk(True), timeout=timeout_sec + 2.0)
+            except TypeError:
+                raw = await asyncio.wait_for(_call_sdk(False), timeout=timeout_sec + 2.0)
+
             if hasattr(raw, "model_dump"):
                 return raw.model_dump()
-            if isinstance(raw, dict):
-                return raw
-            return {"answers": raw}
+            return raw
 
         # Path B: Direct REST call to POST https://api.typesafe.ai/v1/systemone
         if not self.jev_api_key:
@@ -442,10 +498,16 @@ class TriageClient:
             "Content-Type": "application/json",
         }
         if self._http_client is not None:
-            resp = await self._http_client.post(url, json=request_body, headers=headers)
+            resp = await asyncio.wait_for(
+                self._http_client.post(url, json=request_body, headers=headers),
+                timeout=timeout_sec + 2.0,
+            )
         else:
-            async with httpx.AsyncClient(timeout=float(self.models_cfg.jev.timeout_sec)) as client:
-                resp = await client.post(url, json=request_body, headers=headers)
+            async with httpx.AsyncClient(timeout=timeout_sec) as client:
+                resp = await asyncio.wait_for(
+                    client.post(url, json=request_body, headers=headers),
+                    timeout=timeout_sec + 2.0,
+                )
 
         if resp.status_code >= 400:
             raise httpx.HTTPStatusError(
@@ -521,8 +583,11 @@ class TriageClient:
             except Exception as exc:
                 last_error = exc
                 status = getattr(getattr(exc, "response", None), "status_code", None)
-                # Only try pinned_fallback on 404 / model error; quota/auth errors skip straight to OpenAI fallback
-                if status in (401, 402, 403, 429) or isinstance(exc, PermissionError):
+                # Only try pinned_fallback on 404 / model-not-found; auth/quota/timeout skip straight to fallback
+                if (
+                    status in (401, 402, 403, 429)
+                    or isinstance(exc, (PermissionError, TimeoutError, asyncio.TimeoutError))
+                ):
                     break
 
         # 4. Graceful fallback to OpenAI Luna (Invariant #5)

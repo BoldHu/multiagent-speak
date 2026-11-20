@@ -14,7 +14,7 @@ class JevSettings(BaseModel):
     base_url: str = "https://api.typesafe.ai"
     model: str = "jev-latest"
     pinned_fallback: str = "jev-1.14.0"
-    timeout_sec: int = 20
+    timeout_sec: float = 20.0
     auto_fallback_to_openai: bool = True
     cost_per_call_usd: float = 0.0005
 
