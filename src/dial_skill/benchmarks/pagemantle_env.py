@@ -77,26 +77,106 @@ class ModelBudgetTimer:
         return self.model_elapsed_sec >= self.soft_cap_sec
 
 
-def _discover_service_files(dataset_dir: Path, service: str) -> list[Path]:
-    """Find disk files (json/jsonl/csv/parquet/sqlite/duckdb) associated with a service."""
+_DATA_EXTENSIONS = {".json", ".jsonl", ".csv", ".parquet", ".sqlite", ".sqlite3", ".db", ".duckdb", ".md"}
+_SKIP_DIR_NAMES = {".git", ".cache", ".huggingface", "__pycache__"}
+_SKIP_FILE_NAMES = {"readme.md", ".gitattributes", ".gitignore", "license", "license.md"}
+
+_SERVICE_ALIASES: dict[str, tuple[str, ...]] = {
+    "slack": ("slack",),
+    "notion": ("notion", "wiki"),
+    "linear": ("linear",),
+    "hubspot": ("hubspot", "crm"),
+    "stripe": ("stripe", "billing"),
+    "posthog": ("posthog",),
+    "google_analytics": ("google_analytics", "google-analytics", "ga4", "googleanalytics"),
+    "google_search_console": ("google_search_console", "google-search-console", "search_console", "search-console", "gsc"),
+    "google_calendar": ("google_calendar", "google-calendar", "gcal", "calendar"),
+    "bigquery": ("bigquery", "bq"),
+    "snowflake": ("snowflake",),
+}
+
+
+def _list_all_data_files(dataset_dir: Path) -> list[Path]:
+    """Recursively list all candidate data files under dataset_dir (ignoring .cache/.git/README)."""
     if not dataset_dir.exists():
         return []
-    aliases = {
-        "google_analytics": ["google_analytics", "ga", "ga4"],
-        "google_search_console": ["google_search_console", "gsc", "search_console"],
-        "google_calendar": ["google_calendar", "gcal", "calendar"],
-    }.get(service, [service])
+    files: list[Path] = []
+    for p in sorted(dataset_dir.rglob("*")):
+        if not p.is_file():
+            continue
+        if any(part in _SKIP_DIR_NAMES or part.startswith(".cache") for part in p.relative_to(dataset_dir).parts):
+            continue
+        if p.name.lower() in _SKIP_FILE_NAMES:
+            continue
+        if p.suffix.lower() in _DATA_EXTENSIONS:
+            files.append(p)
+    return files
 
-    found: list[Path] = []
+
+def _path_matches_service(rel_path_lower: str, service: str) -> bool:
+    tokens = set(
+        rel_path_lower.replace("\\", "/").replace("-", "_").replace(".", "/").split("/")
+    )
+    aliases = _SERVICE_ALIASES.get(service, (service,))
     for alias in aliases:
-        sub = dataset_dir / alias
-        if sub.is_dir():
-            for ext in ("*.json", "*.jsonl", "*.csv", "*.parquet", "*.sqlite", "*.db", "*.duckdb"):
-                found.extend(sorted(sub.rglob(ext)))
-        for ext in (".json", ".jsonl", ".csv", ".parquet", ".sqlite", ".db", ".duckdb"):
-            direct = dataset_dir / f"{alias}{ext}"
-            if direct.is_file():
-                found.append(direct)
+        norm_alias = alias.replace("-", "_")
+        if norm_alias in tokens:
+            return True
+        if len(norm_alias) >= 4 and norm_alias in rel_path_lower.replace("-", "_"):
+            return True
+    # Special token check for short `ga` folder/stem
+    if service == "google_analytics" and "ga" in tokens:
+        return True
+    return False
+
+
+def _list_db_tables(path: Path) -> list[str]:
+    suf = path.suffix.lower()
+    if suf in (".sqlite", ".sqlite3", ".db"):
+        try:
+            con = sqlite3.connect(str(path))
+            tables = [
+                str(r[0]).lower()
+                for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+            ]
+            con.close()
+            return tables
+        except Exception:
+            return []
+    if suf == ".duckdb":
+        try:
+            import duckdb  # type: ignore[import-not-found]
+
+            con = duckdb.connect(str(path), read_only=True)
+            tables = [str(r[0]).lower() for r in con.execute("SHOW TABLES").fetchall()]
+            con.close()
+            return tables
+        except Exception:
+            return []
+    return []
+
+
+def _discover_service_files(dataset_dir: Path, service: str) -> list[Path]:
+    """Recursively find disk files (nested data/, parquet, sqlite, duckdb, json, md) for a service."""
+    all_files = _list_all_data_files(dataset_dir)
+    found: list[Path] = []
+    unmatched_dbs: list[Path] = []
+
+    for p in all_files:
+        rel_lower = p.relative_to(dataset_dir).as_posix().lower()
+        if _path_matches_service(rel_lower, service):
+            found.append(p)
+        elif p.suffix.lower() in (".sqlite", ".sqlite3", ".db", ".duckdb"):
+            if not any(_path_matches_service(rel_lower, s) for s in ALL_11_SERVICES):
+                unmatched_dbs.append(p)
+
+    # If there is a unified company DB (e.g. pagemantle.duckdb / pagemantle.sqlite), inspect its tables
+    for db_path in unmatched_dbs:
+        tables = _list_db_tables(db_path)
+        aliases = _SERVICE_ALIASES.get(service, (service,))
+        if any(a.replace("-", "_") in tbl for tbl in tables for a in aliases):
+            found.append(db_path)
+
     # Deduplicate preserving order
     seen: set[Path] = set()
     unique: list[Path] = []
@@ -111,6 +191,16 @@ def _iter_file_records(path: Path, max_rows: int = 5000) -> list[dict[str, Any]]
     """Stream up to max_rows records from disk without loading 10 GB datasets into RAM."""
     suffix = path.suffix.lower()
     records: list[dict[str, Any]] = []
+
+    if suffix == ".md":
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace").strip()
+            if not text:
+                return []
+            first_line = text.splitlines()[0].lstrip("#").strip() or path.stem
+            return [{"id": path.stem, "title": first_line, "file": path.name, "content": text[:2000]}]
+        except Exception:
+            return []
 
     if suffix == ".jsonl":
         with path.open("r", encoding="utf-8", errors="replace") as f:
@@ -169,7 +259,29 @@ def _iter_file_records(path: Path, max_rows: int = 5000) -> list[dict[str, Any]]
             except Exception:
                 return []
 
-    if suffix in (".sqlite", ".db"):
+    if suffix == ".duckdb":
+        try:
+            import duckdb  # type: ignore[import-not-found]
+
+            con = duckdb.connect(str(path), read_only=True)
+            try:
+                tables = [r[0] for r in con.execute("SHOW TABLES").fetchall()]
+                for tbl in tables:
+                    cur = con.execute(f'SELECT * FROM "{tbl}" LIMIT {int(max_rows)}')
+                    cols = [c[0] for c in cur.description]
+                    for row in cur.fetchall():
+                        rec = dict(zip(cols, row))
+                        rec.setdefault("_table", tbl)
+                        records.append(rec)
+                        if len(records) >= max_rows:
+                            return records
+            finally:
+                con.close()
+        except Exception:
+            return []
+        return records
+
+    if suffix in (".sqlite", ".sqlite3", ".db"):
         con = sqlite3.connect(str(path))
         con.row_factory = sqlite3.Row
         try:
@@ -224,7 +336,7 @@ def _run_sql_on_service_files(files: list[Path], sql: str, limit: int = 50) -> l
         pass
 
     # Fallback: SQLite in-memory/file connector (zero extra deps, safe on 12 GB RAM)
-    sqlite_files = [f for f in files if f.suffix.lower() in (".sqlite", ".db")]
+    sqlite_files = [f for f in files if f.suffix.lower() in (".sqlite", ".sqlite3", ".db")]
     if sqlite_files:
         con = sqlite3.connect(str(sqlite_files[0]))
         con.row_factory = sqlite3.Row
@@ -318,6 +430,25 @@ class PageMantleEnv:
 
     def available_services(self) -> list[str]:
         return [svc for svc, files in self._service_files.items() if files]
+
+    def describe_dataset_layout(self, max_files: int = 40) -> dict[str, Any]:
+        """Return diagnostic summary of raw files on disk vs matched services."""
+        raw_files: list[str] = []
+        if self.dataset_dir.exists():
+            for p in sorted(self.dataset_dir.rglob("*")):
+                if p.is_file() and not any(
+                    part in _SKIP_DIR_NAMES or part.startswith(".cache")
+                    for part in p.relative_to(self.dataset_dir).parts
+                ):
+                    size_mb = round(p.stat().st_size / (1024 * 1024), 2)
+                    raw_files.append(f"{p.relative_to(self.dataset_dir).as_posix()} ({size_mb} MB)")
+                    if len(raw_files) >= max_files:
+                        break
+        return {
+            "dataset_dir": str(self.dataset_dir),
+            "raw_files_sample": raw_files,
+            "service_file_counts": {svc: len(files) for svc, files in self._service_files.items()},
+        }
 
     def get_openai_tool_schemas(self, read_only: bool = False) -> list[dict[str, Any]]:
         """Expose OpenAI function-calling schemas covering all 11 PageMantle services."""

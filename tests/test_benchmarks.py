@@ -188,6 +188,18 @@ def test_pagemantle_env_all_11_services_and_180s_timer(tmp_path: Path) -> None:
     assert timer.model_elapsed_sec == 0.0
     assert timer.timed_out is False
 
+    # Verify nested data/ layout + markdown + unified SQLite discovery
+    nested_root = tmp_path / "nested_pm"
+    (nested_root / "data" / "notion").mkdir(parents=True)
+    (nested_root / "data" / "notion" / "security_policy.md").write_text("# Security Policy\nNo raw PII in public channels.\n", encoding="utf-8")
+    (nested_root / "data" / "google-analytics").mkdir(parents=True)
+    (nested_root / "data" / "google-analytics" / "traffic.jsonl").write_text('{"id": "GA-1", "sessions": 4200}\n', encoding="utf-8")
+    nested_env = PageMantleEnv(dataset_dir=nested_root)
+    assert "notion" in nested_env.available_services()
+    assert "google_analytics" in nested_env.available_services()
+    assert len(nested_env.mine_verified_facts(limit_per_service=2)) == 2
+    assert len(nested_env.describe_dataset_layout()["raw_files_sample"]) == 2
+
 
 def test_build_pagemantle_ext_64_tasks_db_grounding_and_isolation(tmp_path: Path) -> None:
     ds_dir = _create_mock_pagemantle_dataset(tmp_path)
