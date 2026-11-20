@@ -188,17 +188,34 @@ def test_pagemantle_env_all_11_services_and_180s_timer(tmp_path: Path) -> None:
     assert timer.model_elapsed_sec == 0.0
     assert timer.timed_out is False
 
-    # Verify nested data/ layout + markdown + unified SQLite discovery
+    # Verify nested data/ layout + markdown + .tar.gz extraction + real ts record ID grounding
+    import tarfile
+
     nested_root = tmp_path / "nested_pm"
-    (nested_root / "data" / "notion").mkdir(parents=True)
-    (nested_root / "data" / "notion" / "security_policy.md").write_text("# Security Policy\nNo raw PII in public channels.\n", encoding="utf-8")
-    (nested_root / "data" / "google-analytics").mkdir(parents=True)
-    (nested_root / "data" / "google-analytics" / "traffic.jsonl").write_text('{"id": "GA-1", "sessions": 4200}\n', encoding="utf-8")
-    nested_env = PageMantleEnv(dataset_dir=nested_root)
-    assert "notion" in nested_env.available_services()
-    assert "google_analytics" in nested_env.available_services()
-    assert len(nested_env.mine_verified_facts(limit_per_service=2)) == 2
-    assert len(nested_env.describe_dataset_layout()["raw_files_sample"]) == 2
+    (nested_root / "data").mkdir(parents=True)
+    # Build two real .tar.gz archives matching Deepnote's layout: analytics.tar.gz & slack.tar.gz
+    stage_dir = tmp_path / "tar_stage"
+    stage_dir.mkdir()
+    ga_file = stage_dir / "ga_sessions.jsonl"
+    ga_file.write_text('{"page": "/pricing", "sessions": 4200}\n', encoding="utf-8")
+    with tarfile.open(nested_root / "data" / "analytics.tar.gz", "w:gz") as tf:
+        tf.add(ga_file, arcname="ga_sessions.jsonl")
+
+    slack_file = stage_dir / "messages.jsonl"
+    slack_file.write_text('{"ts": "1700000123.456789", "channel": "#ops", "text": "Invoice check"}\n', encoding="utf-8")
+    with tarfile.open(nested_root / "data" / "slack.tar.gz", "w:gz") as tf:
+        tf.add(slack_file, arcname="messages.jsonl")
+
+    nested_env = PageMantleEnv(dataset_dir=nested_root, extract_dir=tmp_path / "extracted_pm")
+    ext_status = nested_env.ensure_extracted()
+    assert ext_status["google_analytics"] == "extracted"
+    assert ext_status["slack"] == "extracted"
+    assert nested_env.ensure_extracted()["slack"] == "already_extracted"
+    assert set(nested_env.available_services()) == {"google_analytics", "slack"}
+    mined = nested_env.mine_verified_facts(limit_per_service=2)
+    assert len(mined) == 2
+    for fact in mined:
+        assert nested_env.verify_record_exists(fact["service"], fact["record_id"]) is True
 
 
 def test_build_pagemantle_ext_64_tasks_db_grounding_and_isolation(tmp_path: Path) -> None:

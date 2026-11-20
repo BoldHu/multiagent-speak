@@ -8,13 +8,14 @@ import json
 import logging
 import sqlite3
 import sys
+import tarfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from dial_skill.schemas import ACTIVE_SKILLS, ChatMessage, InterventionTier, PageMantleTask
-from dial_skill.utils.drive import get_drive_root
+from dial_skill.utils.drive import get_drive_root, is_colab
 
 logger = logging.getLogger(__name__)
 
@@ -88,12 +89,129 @@ _SERVICE_ALIASES: dict[str, tuple[str, ...]] = {
     "hubspot": ("hubspot", "crm"),
     "stripe": ("stripe", "billing"),
     "posthog": ("posthog",),
-    "google_analytics": ("google_analytics", "google-analytics", "ga4", "googleanalytics"),
+    "google_analytics": ("google_analytics", "google-analytics", "analytics", "ga4", "googleanalytics"),
     "google_search_console": ("google_search_console", "google-search-console", "search_console", "search-console", "gsc"),
     "google_calendar": ("google_calendar", "google-calendar", "gcal", "calendar"),
     "bigquery": ("bigquery", "bq"),
     "snowflake": ("snowflake",),
 }
+
+ARCHIVE_TO_SERVICE: dict[str, str] = {
+    "slack": "slack",
+    "notion": "notion",
+    "linear": "linear",
+    "hubspot": "hubspot",
+    "stripe": "stripe",
+    "posthog": "posthog",
+    "analytics": "google_analytics",
+    "google_analytics": "google_analytics",
+    "search_console": "google_search_console",
+    "google_search_console": "google_search_console",
+    "calendar": "google_calendar",
+    "google_calendar": "google_calendar",
+    "bigquery": "bigquery",
+    "snowflake": "snowflake",
+}
+
+_PRIMARY_ID_KEYS: tuple[str, ...] = (
+    "id",
+    "record_id",
+    "ticket_id",
+    "issue_id",
+    "identifier",
+    "invoice_id",
+    "deal_id",
+    "contact_id",
+    "company_id",
+    "hs_object_id",
+    "customer_id",
+    "subscription_id",
+    "charge_id",
+    "payment_intent",
+    "event_id",
+    "distinct_id",
+    "uuid",
+    "ts",
+    "client_msg_id",
+    "message_id",
+    "channel_id",
+    "page_id",
+    "ical_uid",
+    "key",
+    "title",
+    "summary",
+    "name",
+    "email",
+    "url",
+    "query",
+    "slug",
+)
+
+
+def default_extract_dir(dataset_dir: Path) -> Path:
+    """Use fast local SSD on Colab (/content/pagemantle_extracted) to avoid slow Drive FUSE writes."""
+    if is_colab():
+        return Path("/content/pagemantle_extracted")
+    return dataset_dir / "extracted"
+
+
+def _safe_extract_tar(archive_path: Path, dest_dir: Path) -> None:
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(archive_path, "r:*") as tf:
+        try:
+            tf.extractall(path=dest_dir, filter="data")
+        except TypeError:
+            # Python < 3.12 fallback with path-traversal guard
+            base = dest_dir.resolve()
+            safe_members = []
+            for m in tf.getmembers():
+                target = (dest_dir / m.name).resolve()
+                if str(target).startswith(str(base)):
+                    safe_members.append(m)
+            tf.extractall(path=dest_dir, members=safe_members)
+
+
+def extract_pagemantle_archives(
+    dataset_dir: str | Path,
+    extract_dir: str | Path | None = None,
+    services: Sequence[str] | None = None,
+    force: bool = False,
+) -> dict[str, str]:
+    """Idempotently unpack PageMantle data/<service>.tar.gz archives onto fast local storage."""
+    ds_dir = Path(dataset_dir)
+    out_root = Path(extract_dir) if extract_dir is not None else default_extract_dir(ds_dir)
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    wanted = set(services) if services is not None else set(ALL_11_SERVICES)
+    status: dict[str, str] = {}
+
+    archive_dirs = [ds_dir / "data", ds_dir]
+    seen_services: set[str] = set()
+    for adir in archive_dirs:
+        if not adir.is_dir():
+            continue
+        for archive in sorted(adir.glob("*.tar.gz")) + sorted(adir.glob("*.tgz")):
+            stem = archive.name
+            if stem.endswith(".tar.gz"):
+                stem = stem[:-7]
+            elif stem.endswith(".tgz"):
+                stem = stem[:-4]
+            svc = ARCHIVE_TO_SERVICE.get(stem.lower().replace("-", "_"))
+            if svc is None or svc not in wanted or svc in seen_services:
+                continue
+            seen_services.add(svc)
+            svc_dest = out_root / svc
+            marker = svc_dest / ".extracted_ok"
+            if marker.is_file() and not force:
+                status[svc] = "already_extracted"
+                continue
+            size_mb = archive.stat().st_size / (1024 * 1024)
+            logger.info("Extracting %s (%.1f MB) -> %s", archive.name, size_mb, svc_dest)
+            _safe_extract_tar(archive, svc_dest)
+            marker.write_text(f"source={archive.name}\n", encoding="utf-8")
+            status[svc] = "extracted"
+
+    return status
 
 
 def _list_all_data_files(dataset_dir: Path) -> list[Path]:
@@ -377,13 +495,18 @@ class PageMantleEnv:
         self,
         *,
         dataset_dir: str | Path | None = None,
+        extract_dir: str | Path | None = None,
         benchmark_repo_dir: str | Path | None = None,
         max_tool_calls: int = 8,
         hard_time_cap_sec: float = 180.0,
         soft_time_cap_sec: float = 90.0,
+        auto_extract: bool = False,
     ) -> None:
         self.dataset_dir = (
             Path(dataset_dir) if dataset_dir else get_drive_root() / "datasets" / "pagemantle"
+        )
+        self.extract_dir = (
+            Path(extract_dir) if extract_dir is not None else default_extract_dir(self.dataset_dir)
         )
         self.benchmark_repo_dir = Path(benchmark_repo_dir) if benchmark_repo_dir else None
         self.max_tool_calls = max_tool_calls
@@ -393,10 +516,38 @@ class PageMantleEnv:
         )
         self.tool_call_count = 0
         self.call_history: list[dict[str, Any]] = []
-        self._service_files: dict[str, list[Path]] = {
-            svc: _discover_service_files(self.dataset_dir, svc) for svc in ALL_11_SERVICES
-        }
+        self._service_files: dict[str, list[Path]] = {}
+        if auto_extract:
+            self.ensure_extracted()
+        else:
+            self._refresh_service_files()
         self._native_registry: Any | None = self._try_load_native_registry()
+
+    def _refresh_service_files(self) -> None:
+        """Discover data files for all 11 services, preferring extracted full archives over sample/."""
+        self._service_files = {}
+        for svc in ALL_11_SERVICES:
+            extracted_svc_dir = self.extract_dir / svc
+            extracted_files = _list_all_data_files(extracted_svc_dir) if extracted_svc_dir.is_dir() else []
+            if extracted_files:
+                self._service_files[svc] = extracted_files
+            else:
+                self._service_files[svc] = _discover_service_files(self.dataset_dir, svc)
+
+    def ensure_extracted(
+        self,
+        services: Sequence[str] | None = None,
+        force: bool = False,
+    ) -> dict[str, str]:
+        """Extract data/*.tar.gz archives onto fast local SSD (idempotent) and refresh service index."""
+        status = extract_pagemantle_archives(
+            dataset_dir=self.dataset_dir,
+            extract_dir=self.extract_dir,
+            services=services,
+            force=force,
+        )
+        self._refresh_service_files()
+        return status
 
     def _try_load_native_registry(self) -> Any | None:
         """Inspect cloned deepnote/agent-initiative-benchmark and wrap its native tool registry if present."""
@@ -446,6 +597,7 @@ class PageMantleEnv:
                         break
         return {
             "dataset_dir": str(self.dataset_dir),
+            "extract_dir": str(self.extract_dir),
             "raw_files_sample": raw_files,
             "service_file_counts": {svc: len(files) for svc, files in self._service_files.items()},
         }
@@ -617,15 +769,24 @@ class PageMantleEnv:
     def _get_record(self, service: str, record_id: str) -> dict[str, Any]:
         files = self._service_files.get(service, [])
         needle = record_id.strip().lower()
-        id_keys = ("id", "record_id", "ticket_id", "issue_id", "invoice_id", "deal_id", "key", "title", "name", "slug")
+        if not needle:
+            return {"service": service, "found": False, "record": None}
+
+        # O(1) fast path for Markdown/document files whose filename stem IS the record ID (e.g. Notion UUIDs)
         for path in files:
+            if path.stem.lower() == needle:
+                recs = _iter_file_records(path, max_rows=1)
+                if recs:
+                    return {"service": service, "found": True, "record": recs[0]}
+
+        for path in files[:200]:
             for rec in _iter_file_records(path, max_rows=5000):
-                for k in id_keys:
+                for k in _PRIMARY_ID_KEYS:
                     val = rec.get(k)
                     if val is not None and str(val).strip().lower() == needle:
                         return {"service": service, "found": True, "record": rec}
                 # Fallback substring match if exact key differs
-                if needle and needle in json.dumps(rec, ensure_ascii=False, default=str).lower():
+                if needle in json.dumps(rec, ensure_ascii=False, default=str).lower():
                     return {"service": service, "found": True, "record": rec}
         return {"service": service, "found": False, "record": None}
 
@@ -640,22 +801,37 @@ class PageMantleEnv:
         res = self._get_record(service, record_id)
         return bool(res.get("found"))
 
+    @staticmethod
+    def _extract_record_id(rec: dict[str, Any]) -> str | None:
+        for k in _PRIMARY_ID_KEYS:
+            val = rec.get(k)
+            if val is not None:
+                s = str(val).strip()
+                if s and len(s) <= 120:
+                    return s
+        # Fallback: first real non-empty scalar value from the record itself (never invent fake IDs!)
+        for k, val in rec.items():
+            if k.startswith("_") or val is None or isinstance(val, (dict, list, bool)):
+                continue
+            s = str(val).strip()
+            if 3 <= len(s) <= 80:
+                return s
+        return None
+
     def mine_verified_facts(self, limit_per_service: int = 8) -> list[dict[str, Any]]:
         """Extract real, verifiable records across all available PageMantle services."""
         facts: list[dict[str, Any]] = []
-        id_keys = ("id", "record_id", "ticket_id", "issue_id", "invoice_id", "deal_id", "key", "title", "name")
         for svc in ALL_11_SERVICES:
             files = self._service_files.get(svc, [])
             svc_count = 0
-            for path in files:
-                for idx, rec in enumerate(_iter_file_records(path, max_rows=limit_per_service * 3)):
-                    rec_id = None
-                    for k in id_keys:
-                        if rec.get(k):
-                            rec_id = str(rec[k])
-                            break
-                    if rec_id is None:
-                        rec_id = f"{path.stem}_{idx}"
+            seen_ids: set[str] = set()
+            per_file_cap = max(2, limit_per_service) if len(files) <= 3 else max(1, limit_per_service // min(len(files), limit_per_service))
+            for path in files[: max(limit_per_service * 3, 24)]:
+                for rec in _iter_file_records(path, max_rows=per_file_cap * 3):
+                    rec_id = self._extract_record_id(rec)
+                    if not rec_id or rec_id in seen_ids:
+                        continue
+                    seen_ids.add(rec_id)
                     facts.append(
                         {
                             "service": svc,

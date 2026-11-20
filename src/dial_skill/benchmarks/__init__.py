@@ -9,6 +9,7 @@ from dial_skill.benchmarks.pagemantle_env import (
     ALL_11_SERVICES,
     ModelBudgetTimer,
     PageMantleEnv,
+    extract_pagemantle_archives,
     load_official_tasks,
 )
 from dial_skill.benchmarks.when2speak import (
