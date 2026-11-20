@@ -55,8 +55,11 @@ def validate_notebook_file(path: Path) -> list[str]:
     if "autoreload" not in all_code or "git" not in all_code:
         errors.append(f"{path.name}: missing Universal Cell 1 (git sync & autoreload)")
 
-    # Verify zero hardcoded secret keys
-    if _SECRET_LEAK_RE.search(all_code):
+    # Verify zero hardcoded secret keys in source or outputs
+    all_output_text = "\n".join(
+        str(out) for c in code_cells for out in c.get("outputs", [])
+    )
+    if _SECRET_LEAK_RE.search(all_code) or _SECRET_LEAK_RE.search(all_output_text):
         errors.append(f"{path.name}: POTENTIAL HARDCODED API KEY DETECTED!")
 
     # Verify Python AST & bytecode compilation (allowing Colab/IPython top-level await)

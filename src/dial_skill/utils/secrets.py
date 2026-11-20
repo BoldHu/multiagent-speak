@@ -73,9 +73,10 @@ def _resolve_secret(
 
     # 2. Google Drive secrets folder
     drive_candidates: list[Path] = [get_drive_root(drive_root) / "secrets" / filename]
-    colab_secret_path = COLAB_DEFAULT_DRIVE_ROOT / "secrets" / filename
-    if colab_secret_path not in drive_candidates:
-        drive_candidates.append(colab_secret_path)
+    if drive_root is None:
+        colab_secret_path = COLAB_DEFAULT_DRIVE_ROOT / "secrets" / filename
+        if colab_secret_path not in drive_candidates:
+            drive_candidates.append(colab_secret_path)
     for candidate in drive_candidates:
         val = _parse_key_file(candidate)
         if val:

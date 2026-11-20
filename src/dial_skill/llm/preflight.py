@@ -104,9 +104,9 @@ async def run_preflight(
     luna = _select_first_available(cfg.openai.luna_candidates, available_models)
     terra = _select_first_available(cfg.openai.terra_candidates, available_models)
     sol = (
-        _select_first_available(cfg.openai.sol_candidates, available_models)
-        if cfg.openai.sol_candidates
-        else None
+        next((c for c in cfg.openai.sol_candidates if c in available_models), None)
+        if available_models
+        else (cfg.openai.sol_candidates[0] if cfg.openai.sol_candidates else None)
     )
 
     if probe_chat_completion:
