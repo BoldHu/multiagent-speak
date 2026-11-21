@@ -87,10 +87,11 @@ def calibrate_when2speak_thresholds(
     val_turns: Sequence[When2SpeakTurn],
     val_episodes: Sequence[EpisodeResult],
     eval_turns: Sequence[When2SpeakTurn] | None = None,
-    lambda_grid: Sequence[float] = (0.5, 0.75, 1.0, 1.25, 1.5),
-    tau_dm_grid: Sequence[float] = (-0.10, -0.05, 0.0, 0.05, 0.10, 0.15, 0.20),
+    lambda_grid: Sequence[float] = (0.5, 0.75, 1.0, 1.25, 1.5, 2.0),
+    tau_dm_grid: Sequence[float] = (-0.20, -0.10, -0.05, 0.0, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50, 0.60, 0.70),
     theta_floor: float = 0.30,
     max_fir: float | None = None,
+    max_mir: float | None = None,
 ) -> dict[str, float]:
     """Grid-search (lambda, tau_dm) strictly on When2Speak validation split <= 200 turns (Invariant #8)."""
     assert_no_calibration_leakage(list(val_turns), list(eval_turns or []), max_calib_turns=200)
@@ -102,7 +103,8 @@ def calibrate_when2speak_thresholds(
     n_pos = max(1, sum(y_true))
 
     best_unconstrained = (-1.0, 1.0, 0.05, 0.0, 0.0)
-    best_constrained = (-1.0, 1.0, 0.05, 0.0, 0.0)
+    best_fir_only = (-1.0, 1.0, 0.05, 0.0, 0.0)
+    best_both = (-1.0, 1.0, 0.05, 0.0, 0.0)
 
     for lam in lambda_grid:
         for tau in tau_dm_grid:
@@ -121,10 +123,18 @@ def calibrate_when2speak_thresholds(
             cand = (score, float(lam), float(tau), fir, mir)
             if score > best_unconstrained[0]:
                 best_unconstrained = cand
-            if max_fir is not None and fir <= max_fir and score > best_constrained[0]:
-                best_constrained = cand
+            if max_fir is not None and fir <= max_fir:
+                if score > best_fir_only[0]:
+                    best_fir_only = cand
+                if max_mir is not None and mir <= max_mir and score > best_both[0]:
+                    best_both = cand
 
-    chosen = best_constrained if (max_fir is not None and best_constrained[0] >= 0.0) else best_unconstrained
+    if max_fir is not None and max_mir is not None and best_both[0] >= 0.0:
+        chosen = best_both
+    elif max_fir is not None and best_fir_only[0] >= 0.0:
+        chosen = best_fir_only
+    else:
+        chosen = best_unconstrained
     return {
         "best_lambda": chosen[1],
         "best_tau_dm": chosen[2],

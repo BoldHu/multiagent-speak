@@ -240,6 +240,9 @@ class DialSkillAgent:
             recon_items=slate.recon_items,
             skill_priors=updated_priors,
             candidate_skills=rebuilt_skills,
+            total_turns=slate.total_turns or len(slate.selected_messages),
+            unique_speakers=slate.unique_speakers or len({m.speaker for m in slate.selected_messages}),
+            prior_agent_turns=slate.prior_agent_turns,
         )
         updated_slate = slate.model_copy(
             update={

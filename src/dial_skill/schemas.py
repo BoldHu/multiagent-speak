@@ -143,6 +143,9 @@ class SharedEvidenceSlate(BaseModel):
     channel_name: str
     env_mode: Literal["when2speak", "pagemantle"]
     latest_msg_id: str
+    total_turns: int = 0
+    unique_speakers: int = 0
+    prior_agent_turns: int = 0
     selected_messages: list[ChatMessage]
     triage_annotations: dict[str, TriageItem]
     recon_items: list[ReconSnippet] = Field(default_factory=list)

@@ -347,6 +347,19 @@ def test_margin_ut_deescalation_and_guard_privacy_ceiling() -> None:
     assert d4.final_tier == InterventionTier.SILENT
     assert d4.binary_speak is False
 
+    # Case 5: Dual-consensus channel cap — when BOTH Advocate & Skeptic cap at THREAD_BRIEF,
+    # never broadcast CHANNEL_INTERVENE even when margin_delta = 0.60 >= 0.50!
+    d5 = compute_gate_decision(
+        slate=base_slate,
+        advocate=AdvocateOutput(slate_hash="h1", advocate_score=0.80, unmitigated_loss="focused thread reply", recommended_skill="diagnose", minimum_effective_channel="THREAD_BRIEF", cited_evidence_ids=["m1"]),
+        skeptic=SkepticOutput(slate_hash="h1", skeptic_score=0.20, disruption_risk="low", matched_veto_conditions=[], max_acceptable_channel=InterventionTier.THREAD_BRIEF, cited_evidence_ids=["m1"]),
+        skill_store=store,
+        cfg=cfg,
+    )
+    assert d5.raw_tier == InterventionTier.CHANNEL_INTERVENE
+    assert d5.final_tier == InterventionTier.THREAD_BRIEF
+    assert any("dual_consensus_channel_cap" in r for r in d5.deescalation_reasons)
+
 
 def test_fast_silence_short_circuit_skips_stage2(tmp_path: Path) -> None:
     messages = [
@@ -629,7 +642,8 @@ def test_when2speak_mode_prompt_dispatch_chatter_pruning_and_compression(tmp_pat
     # Token reduction on 8-turn chat comfortably exceeds 40%
     reduction = 1.0 - (ep.prompt_tokens_slate / max(1, ep.prompt_tokens_raw))
     assert reduction >= 0.40, f"Expected >=40% token reduction, got {reduction:.2%}"
-    # Verify Stage-2 prompts received When2Speak group-chat prompt (not enterprise SaaS prompt)
+    # Verify Stage-2 prompts received When2Speak group-chat prompt with temporal participation header
     assert len(fake_oai.seen_prompts) == 2
     assert all("[Skills]" not in user_msg for _, user_msg in fake_oai.seen_prompts)
+    assert all("turns=8 speakers=3" in user_msg for _, user_msg in fake_oai.seen_prompts)
 

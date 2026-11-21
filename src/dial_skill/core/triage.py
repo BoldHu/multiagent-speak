@@ -107,6 +107,9 @@ def rebuild_slate_with_recon(
         recon_items=merged_recon,
         skill_priors=slate.skill_priors,
         candidate_skills=slate.candidate_skills,
+        total_turns=slate.total_turns or len(slate.selected_messages),
+        unique_speakers=slate.unique_speakers or len({m.speaker for m in slate.selected_messages}),
+        prior_agent_turns=slate.prior_agent_turns,
     )
     return slate.model_copy(
         update={
@@ -140,20 +143,31 @@ class TriageStage:
             return list(range(n))
 
         k_base = max(2, self.cfg.triage.k_slate)
-        # In compact group chats (When2Speak), cap at 4 turns (2 pinned + 1 need + 1 defer/scope)
-        k_eff = min(k_base, 4) if env_mode == "when2speak" else k_base
+        # In compact group chats (When2Speak), tighten older-turn budget for >=45% token compression while preserving Invariant #2
+        if env_mode == "when2speak":
+            k_eff = min(k_base, 3 if n <= 7 else 4)
+        else:
+            k_eff = k_base
 
         # Always include latest 2 turns for immediate conversational continuity
         pinned = {n - 2, n - 1}
         older_indices = list(range(0, n - 2))
 
-        # Prune low-VoI background chatter from older turns so Stage-1 genuinely compresses noise
-        older_informative = [
-            i
-            for i in older_indices
-            if annotations[messages[i].msg_id].stance != "background_chatter"
-            or annotations[messages[i].msg_id].p_decision_change >= 0.35
-        ]
+        # Prune low-VoI chatter from older turns so Stage-1 genuinely compresses noise
+        if env_mode == "when2speak":
+            older_informative = [
+                i
+                for i in older_indices
+                if annotations[messages[i].msg_id].stance != "background_chatter"
+                and annotations[messages[i].msg_id].p_decision_change >= 0.55
+            ]
+        else:
+            older_informative = [
+                i
+                for i in older_indices
+                if annotations[messages[i].msg_id].stance != "background_chatter"
+                or annotations[messages[i].msg_id].p_decision_change >= 0.35
+            ]
         if not older_informative:
             return sorted(pinned)
 
@@ -280,6 +294,10 @@ class TriageStage:
             else _pick_top_candidate_skills(skill_priors, skill_store, top_k=2)
         )
 
+        total_turns = len(messages)
+        unique_speakers = len({m.speaker for m in messages})
+        prior_agent_turns = sum(1 for m in messages if m.speaker == "[AGENT]")
+
         canonical_text, slate_hash = render_shared_evidence_slate(
             channel_name=channel_name,
             env_mode=env_mode,
@@ -289,12 +307,18 @@ class TriageStage:
             recon_items=[],
             skill_priors=skill_priors,
             candidate_skills=candidate_skills,
+            total_turns=total_turns,
+            unique_speakers=unique_speakers,
+            prior_agent_turns=prior_agent_turns,
         )
         return SharedEvidenceSlate(
             conversation_id=conversation_id,
             channel_name=channel_name,
             env_mode=env_mode,
             latest_msg_id=latest_msg_id,
+            total_turns=total_turns,
+            unique_speakers=unique_speakers,
+            prior_agent_turns=prior_agent_turns,
             selected_messages=selected_messages,
             triage_annotations=selected_anns,
             recon_items=[],

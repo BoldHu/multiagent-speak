@@ -151,6 +151,22 @@ def compute_gate_decision(
 
             tier_int = max(1, raw_int - deesc_steps)
 
+            # Dual-consensus channel ceiling: never broadcast louder than BOTH Advocate's minimum
+            # effective channel AND Skeptic's maximum acceptable channel.
+            if (
+                advocate is not None
+                and skeptic is not None
+                and gate_mode not in ("advocate_only", "skeptic_only")
+            ):
+                adv_min_int = TIER_TO_INT[InterventionTier(advocate.minimum_effective_channel)]
+                skep_max_int = TIER_TO_INT[skeptic.max_acceptable_channel]
+                consensus_cap = max(1, max(adv_min_int, skep_max_int))
+                if tier_int > consensus_cap:
+                    tier_int = consensus_cap
+                    deescalation_reasons.append(
+                        f"dual_consensus_channel_cap={INT_TO_TIER[consensus_cap].value}"
+                    )
+
             # Skill privacy/channel ceiling
             if skill_card is not None:
                 max_policy_int = max(1, TIER_TO_INT[skill_card.channel_policy.max_tier])

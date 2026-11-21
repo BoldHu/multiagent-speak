@@ -96,35 +96,42 @@ SKEPTIC_JSON_SCHEMA: dict[str, Any] = {
     },
 }
 
-# Mode-calibrated prompts for general multi-party group chats (When2Speak benchmark)
-WHEN2SPEAK_ADVOCATE_SYSTEM_PROMPT = """You are the ADVOCATE evaluator for a proactive AI assistant (`[AGENT]`) silently observing a multi-party group chat.
-Your sole job is to evaluate the Shared Evidence Slate — focusing strictly on the LATEST turn (`latest=...`) in context — from a helpfulness perspective:
-  "Does the latest turn raise an unanswered informational/lookup/recommendation question, factual uncertainty, memory lapse, misconception, or direct request to `[AGENT]` where speaking right now adds concrete, immediate value?"
-
-Rules:
-1. Ground your evaluation STRICTLY in the Shared Evidence Slate and cite exact msg_id items. Focus on whether `[AGENT]` should speak RIGHT NOW immediately after the latest turn.
-2. Score `advocate_score` in [0.00, 1.00] using the FULL calibrated range:
-   - 0.00 - 0.25: Ordinary human-to-human banter, reactions, agreements, personal anecdotes/opinions, polite thanks/closings with no new question, personal questions aimed at another human, or an earlier question already answered.
-   - 0.26 - 0.49: Casual topic discussion or human-to-human advice with no explicit question, memory lapse, or factual error.
-   - 0.50 - 0.74: Implicit knowledge gap, mild uncertainty, or open group decision where a brief factual suggestion might help.
-   - 0.75 - 1.00: Clear, direct reason for `[AGENT]` to speak right now — an unanswered open question to the group ("Does anyone know...", "Isn't there a...", "What was it called...", "Can anyone recommend..."), factual uncertainty/memory lapse, clear factual misconception, or direct question/request to `[AGENT]`.
-3. Select the closest `recommended_skill` (`find`, `explain`, `analyze`, `check`, `diagnose`, `decide`, `coordinate`, `guard`, or `none`).
-4. Set `minimum_effective_channel` (`THREAD_BRIEF` for normal group replies, `DM_NUDGE` for minor optional tips, `CHANNEL_INTERVENE` for direct/urgent factual answers).
-5. Be strictly calibrated: most human group-chat turns (~85%) do NOT need the AI to speak. Score <= 0.25 on normal human flow, and >= 0.75 on genuine unanswered questions or direct requests. Return strict JSON only."""
-
-WHEN2SPEAK_SKEPTIC_SYSTEM_PROMPT = """You are the SKEPTIC evaluator for a proactive AI assistant (`[AGENT]`) silently observing a multi-party group chat.
-Your sole job is to evaluate the Shared Evidence Slate — focusing strictly on the LATEST turn (`latest=...`) in context — from a restraint and conversational-flow perspective:
-  "If `[AGENT]` speaks right now after the latest turn, would it be an unwelcome interruption of natural human-to-human chat, redundant, or unnecessary?"
+# Mode-calibrated prompts for general multi-party group chats (When2Speak temporal participation benchmark)
+WHEN2SPEAK_ADVOCATE_SYSTEM_PROMPT = """You are the ADVOCATE evaluator for a proactive AI assistant (`[AGENT]`) participating in a multi-party group chat.
+Your job is to evaluate the Shared Evidence Slate — paying strict attention to BOTH the LATEST turn (`latest=...`) AND the conversation depth (`turns=`, `speakers=`, `agent_turns=` in the header) — from a helpful contribution perspective:
+  "Given how far this human group discussion has progressed, does speaking RIGHT NOW add high-value, well-timed assistance without jumping ahead of human participants?"
 
 Rules:
 1. Ground your evaluation STRICTLY in the Shared Evidence Slate and cite exact msg_id items.
-2. Score `skeptic_score` in [0.00, 1.00] using the FULL calibrated range (do NOT default to high scores when someone asks an open factual/lookup question!):
-   - 0.00 - 0.25: LOW disruption risk — the latest turn explicitly asks an unanswered factual/lookup/resource/recommendation question ("Does anyone know...", "What was it called...", "Isn't there a..."), expresses clear factual uncertainty/memory lapse, or directly asks `[AGENT]` for help. Speaking right now is genuinely welcome! Set `max_acceptable_channel = THREAD_BRIEF` or `CHANNEL_INTERVENE`.
-   - 0.26 - 0.49: Mild caution — an implicit factual gap or open question where a concise reply is acceptable (`DM_NUDGE` or `THREAD_BRIEF`).
-   - 0.50 - 0.74: High disruption risk — humans are exchanging personal opinions, tips, or anecdotes with each other without asking for external lookup or AI input.
-   - 0.75 - 1.00: STRONG reason to stay SILENT — pure social banter, jokes, reactions/agreements, personal stories, questions aimed at another human's personal experience, already-answered questions, or simple acknowledgments/closings with no new question. Set `max_acceptable_channel = SILENT`.
-3. List any matched restraint reasons in `matched_veto_conditions` (e.g., `["human_social_banter"]`, `["personal_opinion_exchange"]`, `["already_answered"]`, or `[]` if none).
-4. Be sharply calibrated across the full [0, 1] range: score >= 0.75 on ordinary human banter/flow, and <= 0.25 on genuine unanswered questions or direct `[AGENT]` requests. Return strict JSON only."""
+2. Respect multi-party turn-taking & temporal depth (`turns=` and `speakers=` in the header):
+   - OPENING / VERY EARLY FLOOR (`turns <= 2` or `speakers <= 1`, unless `[AGENT]` is explicitly named): Humans have NOT yet had a chance to respond to each other! Even if `Speaker_0` asks `"Hey everyone, can someone help / does anyone know...?"`, the AI MUST let humans speak first -> score `0.05 - 0.20`.
+   - EARLY ACTIVE HUMAN FLOW (`turns = 3..4`, unless `[AGENT]` is explicitly named): Humans are just starting to share ideas/suggestions -> keep `advocate_score <= 0.35` unless there is a clear factual error needing urgent correction.
+   - DIRECT `[AGENT]` ADDRESS (any turn depth where the latest message explicitly names `[AGENT]`, including questions, follow-ups, or polite thanks like `"Thanks [AGENT]"`): Direct social/informational address warrants a response -> score `0.75 - 0.95`.
+   - MATURE MULTI-PARTY DISCUSSION (`turns >= 5`, multiple speakers engaged): Evaluate all 5 high-value multi-party contribution opportunities:
+     (a) **Synthesis & Reframing**: After multiple speakers share perspectives, dilemmas, or balanced reflections, concisely synthesizing or adding a framing insight (`0.65 - 0.88`).
+     (b) **Data Provision / Source Identification**: Providing concrete facts, tactics, resources, or sources after humans have traded guesses or asked for a definitive answer (`0.72 - 0.95`).
+     (c) **Factual Correction / Concept Definition**: Clarifying a misconception or explaining how an unusual concept, rule, or mechanism works (`0.72 - 0.95`).
+   - Pure filler/laughter/one-word reaction or private logistics at any turn depth -> score `0.00 - 0.20`.
+3. Select the closest `recommended_skill` (`find`, `explain`, `analyze`, `check`, `diagnose`, `decide`, `coordinate`, `guard`, or `none`).
+4. Set `minimum_effective_channel` (`THREAD_BRIEF` for normal replies, `DM_NUDGE` for minor tips, `CHANNEL_INTERVENE` for direct/urgent answers).
+5. Use the FULL calibrated [0.00, 1.00] range. Return strict JSON only."""
+
+WHEN2SPEAK_SKEPTIC_SYSTEM_PROMPT = """You are the SKEPTIC evaluator for a proactive AI assistant (`[AGENT]`) participating in a multi-party group chat.
+Your job is to evaluate the Shared Evidence Slate — paying strict attention to BOTH the LATEST turn (`latest=...`) AND the conversation depth (`turns=`, `speakers=`, `agent_turns=` in the header) — from a temporal-restraint and conversational-flow perspective:
+  "If `[AGENT]` speaks right now, would it prematurely hijack the human floor, interrupt active early human replies, or chime in where no substantive synthesis, clarification, or response is needed?"
+
+Rules:
+1. Ground your evaluation STRICTLY in the Shared Evidence Slate and cite exact msg_id items.
+2. Score `skeptic_score` in [0.00, 1.00] using the FULL calibrated range:
+   - **0.85 - 0.98 (`SILENT`) — Opening / Early-Floor Restraint**: Whenever `turns <= 2` (especially `turns == 1` opening post!) or `speakers <= 1` AND `[AGENT]` is NOT explicitly named, score `>= 0.85` and `max_acceptable_channel = SILENT` — EVEN IF `Speaker_0` asks `"Hey everyone, can anyone help?"`, because the AI must give human participants space to reply first!
+   - **0.65 - 0.84 (`SILENT`) — Active Early Human Back-and-Forth**: When `turns = 3..4` and humans are actively offering suggestions to each other without naming `[AGENT]` or stalling, wait for human dialogue to mature.
+   - **0.05 - 0.25 (`THREAD_BRIEF` or `CHANNEL_INTERVENE`) — Low Disruption Risk**:
+     * Latest turn explicitly mentions/addresses `[AGENT]` (including `"Thanks [AGENT]"` or a direct question).
+     * Mature discussion (`turns >= 6`, multi-speaker) where the latest turn reaches a clear synthesis moment, open conceptual puzzle, competing viewpoints, unresolved practical tactic, or explicit uncertainty where a concise `[AGENT]` contribution (**Synthesis & Reframing**, **Data Provision**, **Source Identification**, **Concept Definition**, or **Factual Correction**) naturally enriches the thread.
+   - **0.30 - 0.55 (`DM_NUDGE` or `THREAD_BRIEF`) — Mild Caution**: `turns >= 5` with a moderately substantive turn where a brief insight might help, though humans could also continue alone.
+   - **0.70 - 0.95 (`SILENT`) — Late-Turn Restraint**: Even when `turns >= 5`, score high skepticism if the latest turn is pure casual filler, a direct personal question to a specific human's life, or an active human reply that already fully answered the point with nothing left to synthesize.
+3. List matched restraint reasons in `matched_veto_conditions` (e.g., `["opening_turn_let_humans_respond"]`, `["early_human_exchange"]`, `["casual_filler"]`, or `[]`).
+4. Be sharply calibrated across the full [0, 1] range. Return strict JSON only."""
 
 # Ablation A4: Single Combined Prompt
 SINGLE_COMBINED_GATE_SYSTEM_PROMPT = """You are a proactive workplace AI gate evaluator.
@@ -192,18 +199,29 @@ def render_shared_evidence_slate(
     recon_items: list[ReconSnippet],
     skill_priors: dict[SkillName, float],
     candidate_skills: list[SkillCard],
+    total_turns: int | None = None,
+    unique_speakers: int | None = None,
+    prior_agent_turns: int = 0,
 ) -> tuple[str, str]:
-    """Render compact canonical SHARED_EVIDENCE_SLATE text and deterministic SHA-256 slate_hash."""
-    body_lines: list[str] = [
-        f"ch={channel_name} mode={env_mode} latest={latest_msg_id}",
-        "[Evidence]",
-    ]
+    """Render compact canonical SHARED_EVIDENCE_SLATE text with participation-state metadata and SHA-256 hash."""
+    n_turns = total_turns if total_turns is not None and total_turns > 0 else len(selected_messages)
+    n_spk = (
+        unique_speakers
+        if unique_speakers is not None and unique_speakers > 0
+        else len({m.speaker for m in selected_messages})
+    )
+    if env_mode == "when2speak":
+        hdr = f"ch={channel_name} turns={n_turns} speakers={n_spk} agent_turns={prior_agent_turns} latest={latest_msg_id}"
+    else:
+        hdr = f"ch={channel_name} mode={env_mode} turns={n_turns} latest={latest_msg_id}"
+
+    body_lines: list[str] = [hdr, "[Evidence]"]
     for msg in selected_messages:
         ann = triage_annotations.get(msg.msg_id)
         if ann is not None:
             st_short = _STANCE_SHORT.get(ann.stance, ann.stance)
             if env_mode == "when2speak":
-                tag = f"{msg.msg_id}|p={ann.p_decision_change:.2f}|{st_short}"
+                tag = f"{msg.msg_id}|{st_short}" if st_short != "chat" else msg.msg_id
             else:
                 tag = f"{msg.msg_id}|p={ann.p_decision_change:.2f}|{st_short}|{ann.skill_hint}"
         else:
