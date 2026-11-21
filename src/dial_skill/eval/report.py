@@ -215,7 +215,7 @@ def plot_fir_mir_pareto(
 def plot_online_learning_curve(
     series: dict[str, Sequence[float]],
     out_path: str | Path,
-    x_labels: Sequence[str] = ("Wave 1", "Wave 2", "Wave 3", "Held-Out (32)"),
+    x_labels: Sequence[str] = ("Wave 1", "Wave 2", "Wave 3", "Held-Out (40)"),
 ) -> Path:
     """Generate fig_online_learning_curve.pdf across Waves 1-3 and Held-Out pm_eval_32."""
     p = Path(out_path)
@@ -246,7 +246,8 @@ def plot_cost_vs_score(points: Sequence[dict[str, Any]], out_path: str | Path) -
 
     fig, ax = plt.subplots(figsize=(5.6, 4.0))
     for pt in points:
-        is_ours = "DIAL-Skill" in str(pt.get("label", ""))
+        lbl = str(pt.get("label", ""))
+        is_ours = ("dial-skill" in lbl.lower()) or ("dial_skill" in lbl.lower())
         ax.scatter(
             [float(pt["cost_per_task_usd"])],
             [float(pt["overall_score"])],
@@ -277,13 +278,47 @@ def plot_ablation_delta(
     ablations: Sequence[dict[str, Any]],
     out_path: str | Path,
 ) -> Path:
-    """Generate fig_ablation_delta.pdf showing relative performance drops across A1-A7."""
+    """Generate fig_ablation_delta.pdf showing relative performance impacts across A1-A7.
+
+    Supports both single-panel (`delta`) and publication dual-panel (`pm_delta` + `fir_delta`) layouts.
+    """
     p = Path(out_path)
     p.parent.mkdir(parents=True, exist_ok=True)
 
     labels = [str(a["label"]) for a in ablations]
-    deltas = [float(a["delta"]) for a in ablations]
     y = np.arange(len(labels))
+    has_dual = any(("pm_delta" in a or "fir_delta" in a) for a in ablations)
+
+    if has_dual:
+        pm_deltas = [float(a.get("pm_delta", 0.0) or 0.0) for a in ablations]
+        fir_deltas = [100.0 * float(a.get("fir_delta", 0.0) or 0.0) for a in ablations]
+        fig, (ax1, ax2) = plt.subplots(
+            1, 2, figsize=(10.2, max(4.0, 0.45 * len(labels))), sharey=True
+        )
+        pm_colors = ["#c44e52" if d < -0.05 else "#55a868" for d in pm_deltas]
+        ax1.barh(y, pm_deltas, color=pm_colors, alpha=0.88)
+        ax1.axvline(0.0, color="black", linewidth=0.9)
+        ax1.set_yticks(y)
+        ax1.set_yticklabels(labels, fontsize=8.5)
+        ax1.invert_yaxis()
+        ax1.set_xlabel("PageMantle Overall Score Change ($\\Delta$, higher is better)")
+        ax1.set_title("Enterprise Quality Drop on PageMantle")
+        ax1.grid(True, axis="x", linestyle="--", alpha=0.35)
+
+        fir_colors = ["#c44e52" if d > 1.0 else "#55a868" for d in fir_deltas]
+        ax2.barh(y, fir_deltas, color=fir_colors, alpha=0.88)
+        ax2.axvline(0.0, color="black", linewidth=0.9)
+        ax2.set_xlabel("When2Speak FIR Change ($\\Delta$ pp, lower is better)")
+        ax2.set_title("False Interruption Explosion on When2Speak")
+        ax2.grid(True, axis="x", linestyle="--", alpha=0.35)
+
+        fig.suptitle("7-Point Ablation Impact vs. Full DIAL-Skill", fontsize=11)
+        fig.tight_layout()
+        fig.savefig(p, format="pdf")
+        plt.close(fig)
+        return p
+
+    deltas = [float(a["delta"]) for a in ablations]
     colors = ["#c44e52" if d < 0 else "#55a868" for d in deltas]
 
     fig, ax = plt.subplots(figsize=(6.2, max(3.6, 0.45 * len(labels))))

@@ -95,7 +95,12 @@ def calibrate_when2speak_thresholds(
 ) -> dict[str, float]:
     """Grid-search (lambda, tau_dm) strictly on When2Speak validation split <= 200 turns (Invariant #8)."""
     assert_no_calibration_leakage(list(val_turns), list(eval_turns or []), max_calib_turns=200)
-    if len(val_turns) != len(val_episodes):
+    by_id = {ep.sample_id: ep for ep in val_episodes}
+    if all(t.sample_id in by_id for t in val_turns):
+        aligned_eps = [by_id[t.sample_id] for t in val_turns]
+    elif len(val_turns) == len(val_episodes):
+        aligned_eps = list(val_episodes)
+    else:
         raise ValueError("val_turns and val_episodes must align 1-to-1.")
 
     y_true = [int(t.label_speak) for t in val_turns]
@@ -109,7 +114,7 @@ def calibrate_when2speak_thresholds(
     for lam in lambda_grid:
         for tau in tau_dm_grid:
             preds = []
-            for ep in val_episodes:
+            for ep in aligned_eps:
                 if ep.gate.short_circuited or ep.gate.advocate_score < theta_floor:
                     preds.append(0)
                 else:
@@ -153,12 +158,26 @@ def sweep_lambda_pareto_from_episodes(
     tau_dm: float = 0.05,
     theta_floor: float = 0.30,
 ) -> list[dict[str, Any]]:
-    """Zero-cost FIR-MIR Pareto sweep over lambda reusing cached Stage-2 Advocate/Skeptic scores."""
-    y_true = [t.label_speak for t in turns]
+    """Zero-cost FIR-MIR Pareto sweep over lambda reusing cached Stage-2 Advocate/Skeptic scores.
+
+    Always aligns episodes to turns by `sample_id` so raw async-completion-order JSONL logs
+    never misalign predictions against ground-truth labels.
+    """
+    by_id = {ep.sample_id: ep for ep in episodes}
+    aligned_pairs = [(t, by_id[t.sample_id]) for t in turns if t.sample_id in by_id]
+    if aligned_pairs:
+        y_true = [t.label_speak for t, _ in aligned_pairs]
+        aligned_episodes = [ep for _, ep in aligned_pairs]
+    elif len(turns) == len(episodes):
+        y_true = [t.label_speak for t in turns]
+        aligned_episodes = list(episodes)
+    else:
+        raise ValueError("No matching sample_ids between turns and episodes.")
+
     rows: list[dict[str, Any]] = []
     for lam in lambdas:
         rescored: list[EpisodeResult] = []
-        for ep in episodes:
+        for ep in aligned_episodes:
             if ep.gate.short_circuited or ep.gate.advocate_score < theta_floor:
                 delta = -1.0
                 speak = False

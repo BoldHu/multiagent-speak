@@ -332,8 +332,12 @@ def test_runner_resume_idempotency_calibration_and_pareto_sweep(tmp_path: Path) 
     assert fake.calls == 4  # Idempotent --resume skipped s_0 and s_1!
 
     cal = calibrate_when2speak_thresholds(val_turns=turns, val_episodes=eps_all)
+    cal_rev = calibrate_when2speak_thresholds(val_turns=turns, val_episodes=list(reversed(eps_all)))
     assert cal["val_macro_f1"] == 1.0
+    assert cal_rev == cal
 
     pareto = sweep_lambda_pareto_from_episodes(turns=turns, episodes=eps_all, lambdas=[0.5, 1.0, 1.5])
+    pareto_rev = sweep_lambda_pareto_from_episodes(turns=turns, episodes=list(reversed(eps_all)), lambdas=[0.5, 1.0, 1.5])
     assert len(pareto) == 3
     assert all("fir" in row and "mir" in row for row in pareto)
+    assert pareto_rev == pareto
