@@ -90,6 +90,7 @@ def calibrate_when2speak_thresholds(
     lambda_grid: Sequence[float] = (0.5, 0.75, 1.0, 1.25, 1.5),
     tau_dm_grid: Sequence[float] = (-0.10, -0.05, 0.0, 0.05, 0.10, 0.15, 0.20),
     theta_floor: float = 0.30,
+    max_fir: float | None = None,
 ) -> dict[str, float]:
     """Grid-search (lambda, tau_dm) strictly on When2Speak validation split <= 200 turns (Invariant #8)."""
     assert_no_calibration_leakage(list(val_turns), list(eval_turns or []), max_calib_turns=200)
@@ -97,9 +98,11 @@ def calibrate_when2speak_thresholds(
         raise ValueError("val_turns and val_episodes must align 1-to-1.")
 
     y_true = [int(t.label_speak) for t in val_turns]
-    best_f1 = -1.0
-    best_lam = 1.0
-    best_tau = 0.05
+    n_neg = max(1, sum(1 - y for y in y_true))
+    n_pos = max(1, sum(y_true))
+
+    best_unconstrained = (-1.0, 1.0, 0.05, 0.0, 0.0)
+    best_constrained = (-1.0, 1.0, 0.05, 0.0, 0.0)
 
     for lam in lambda_grid:
         for tau in tau_dm_grid:
@@ -111,15 +114,23 @@ def calibrate_when2speak_thresholds(
                     delta = ep.gate.advocate_score - lam * ep.gate.skeptic_score
                     preds.append(1 if delta >= tau else 0)
             score = float(f1_score(y_true, preds, average="macro", zero_division=0))
-            if score > best_f1:
-                best_f1 = score
-                best_lam = float(lam)
-                best_tau = float(tau)
+            fp = sum(1 for y, p in zip(y_true, preds) if y == 0 and p == 1)
+            fn = sum(1 for y, p in zip(y_true, preds) if y == 1 and p == 0)
+            fir = fp / n_neg
+            mir = fn / n_pos
+            cand = (score, float(lam), float(tau), fir, mir)
+            if score > best_unconstrained[0]:
+                best_unconstrained = cand
+            if max_fir is not None and fir <= max_fir and score > best_constrained[0]:
+                best_constrained = cand
 
+    chosen = best_constrained if (max_fir is not None and best_constrained[0] >= 0.0) else best_unconstrained
     return {
-        "best_lambda": best_lam,
-        "best_tau_dm": best_tau,
-        "val_macro_f1": round(best_f1, 6),
+        "best_lambda": chosen[1],
+        "best_tau_dm": chosen[2],
+        "val_macro_f1": round(chosen[0], 6),
+        "val_fir": round(chosen[3], 6),
+        "val_mir": round(chosen[4], 6),
         "n_val_turns": len(val_turns),
     }
 

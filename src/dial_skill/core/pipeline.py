@@ -214,6 +214,7 @@ class DialSkillAgent:
         *,
         slate: SharedEvidenceSlate,
         candidate_store: SkillStore,
+        focus_skill: str | None = None,
     ) -> GateDecision:
         """Re-run Stage 2 on a cached SharedEvidenceSlate with a candidate SkillStore (for DB-CSE EscrowGate)."""
         rebuilt_skills = [
@@ -221,6 +222,13 @@ class DialSkillAgent:
             for card in slate.candidate_skills
             if candidate_store.get(card.name) is not None
         ]
+        updated_priors = dict(slate.skill_priors)
+        if focus_skill is not None and candidate_store.get(focus_skill) is not None:
+            if not any(c.name == focus_skill for c in rebuilt_skills):
+                rebuilt_skills.append(candidate_store.require(focus_skill))
+            floor = self.cfg.gate.skill_prior_override_floor
+            updated_priors[focus_skill] = max(floor, float(updated_priors.get(focus_skill, 0.0)))
+
         from dial_skill.prompts.templates import render_shared_evidence_slate
 
         canonical_text, slate_hash = render_shared_evidence_slate(
@@ -230,11 +238,12 @@ class DialSkillAgent:
             selected_messages=slate.selected_messages,
             triage_annotations=slate.triage_annotations,
             recon_items=slate.recon_items,
-            skill_priors=slate.skill_priors,
+            skill_priors=updated_priors,
             candidate_skills=rebuilt_skills,
         )
         updated_slate = slate.model_copy(
             update={
+                "skill_priors": updated_priors,
                 "candidate_skills": rebuilt_skills,
                 "canonical_text": canonical_text,
                 "slate_hash": slate_hash,

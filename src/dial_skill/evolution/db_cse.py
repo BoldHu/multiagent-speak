@@ -556,10 +556,7 @@ class DBCSEUpdater:
             self._write_log(log_entry)
             return log_entry
 
-        # 2. Immediate bounded numeric calibration
-        numeric_upd = self.apply_numeric_update(skill_name, feedback.feedback_type)
-
-        # 3. Counterfactual Attribution Critic
+        # 2. Counterfactual Attribution Critic FIRST so numeric & symbolic updates target the exact affected_skill
         current_card = self.skill_store.require(skill_name)
         attribution = await self.diagnose_attribution(
             slate=slate,
@@ -568,6 +565,9 @@ class DBCSEUpdater:
             skill_card=current_card,
         )
         affected_skill = attribution.affected_skill
+
+        # 3. Immediate bounded numeric calibration applied strictly to `affected_skill`
+        numeric_upd = self.apply_numeric_update(affected_skill, feedback.feedback_type)
         target_card = self.skill_store.require(affected_skill)
 
         symbolic_causes = {"VETO_MISSING", "TRIGGER_MISSING", "INVESTIGATION_GAP", "ROUTING_CONFUSION"}
@@ -642,6 +642,21 @@ class DBCSEUpdater:
         candidate_card = target_card.model_copy(update={target_field: final_rules})
         candidate_store.set_skill(candidate_card, bump_version=True)
 
+        # Ensure EscrowGate replays with the patched affected_skill visible in candidate_skills
+        failed_slate_for_escrow = slate
+        if not any(c.name == affected_skill for c in slate.candidate_skills):
+            priors_copy = dict(slate.skill_priors)
+            priors_copy[affected_skill] = max(
+                self.cfg.gate.skill_prior_override_floor,
+                float(priors_copy.get(affected_skill, 0.0)),
+            )
+            failed_slate_for_escrow = slate.model_copy(
+                update={
+                    "candidate_skills": [*slate.candidate_skills, candidate_card],
+                    "skill_priors": priors_copy,
+                }
+            )
+
         # 6. Counterfactual Replay Escrow Gate (Invariant #4)
         escrow_passed = True
         escrow_details: dict[str, Any] = {"escrow_enabled": self.cfg.evolution.enable_escrow_gate}
@@ -654,7 +669,7 @@ class DBCSEUpdater:
             escrow_res = await self.escrow_gate.verify(
                 rescore_fn=rescore_fn,
                 candidate_store=candidate_store,
-                failed_slate=slate,
+                failed_slate=failed_slate_for_escrow,
                 failed_old_decision=gate,
                 feedback=feedback,
                 anchors=anchors,

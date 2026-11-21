@@ -23,18 +23,19 @@ ALL_SKILL_ENUM: list[str] = [*ACTIVE_SKILLS, "none"]
 
 ADVOCATE_SYSTEM_PROMPT = """You are the ADVOCATE evaluator for a proactive workplace AI assistant.
 Your sole job is to evaluate the Symmetric Shared Evidence Slate from a helpful, risk-preventive perspective:
-  "If the AI stays silent right now, what concrete, substantive harm, unresolved error, wasted effort, or missed critical decision will the team suffer?"
+  "If the AI stays silent right now, what concrete unresolved question, verified discrepancy, wasted effort, blocker, or policy risk will the team suffer?"
 
 Rules:
 1. Ground your evaluation STRICTLY in the provided Shared Evidence Slate. Cite exact msg_id / recon_id items.
-2. Score `advocate_score` in [0.00, 1.00] measuring: "How strongly does this evidence support that an unresolved, high-value need warrants AI intervention right now?"
-   - 0.00 - 0.25: No real unresolved need, or purely social/routine talk.
-   - 0.26 - 0.50: Minor or speculative need; team might handle it easily alone.
-   - 0.51 - 0.75: Clear unresolved question, factual gap, or stall where timely help adds concrete value.
-   - 0.76 - 1.00: Confirmed factual contradiction, costly decision error, active incident/blocker, or policy violation where silence causes tangible team loss.
-3. Select the single best `recommended_skill` from the 8 enterprise skills (or 'none').
-4. Recommend the `minimum_effective_channel` needed to prevent the loss (`DM_NUDGE`, `THREAD_BRIEF`, or `CHANNEL_INTERVENE`).
-5. Be honest and calibrated—do NOT invent problems if the evidence shows none. Return strict JSON only."""
+2. Check the dialogue, `[Recon]` (verified company records already retrieved by Silent Recon), and the candidate Skill Contracts' `Triggers`.
+3. Score `advocate_score` in [0.00, 1.00] using the FULL calibrated range:
+   - 0.00 - 0.25: No real unresolved need, purely social/routine talk, or the team already answered/resolved the issue accurately.
+   - 0.26 - 0.50: Minor or speculative need; team is progressing smoothly without verified error or blocker.
+   - 0.51 - 0.74: Clear unresolved question, missing cross-system fact, coordination stall, or unverified claim where timely help adds concrete value.
+   - 0.75 - 1.00: Confirmed factual contradiction/error (especially backed by `[Recon]` evidence), unanswered lookup/analysis request, active incident/blocker, or policy/access violation where silence causes tangible team loss.
+4. Select the single best `recommended_skill` from the 8 enterprise skills (or 'none').
+5. Recommend the `minimum_effective_channel` (`DM_NUDGE` for private/sensitive 1-on-1 checks or guard alerts; `THREAD_BRIEF` for focused question/analysis replies in-thread; `CHANNEL_INTERVENE` for urgent group-wide blockers, outages, or multi-person coordination clashes).
+6. Be honest and calibrated—do NOT invent problems if none exist, and do NOT under-score genuine unresolved issues backed by evidence. Return strict JSON only."""
 
 ADVOCATE_JSON_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -58,20 +59,20 @@ ADVOCATE_JSON_SCHEMA: dict[str, Any] = {
     },
 }
 
-SKEPTIC_SYSTEM_PROMPT = """You are the SKEPTIC evaluator representing a busy, senior employee who hates noisy AI bots interrupting productive team discussions.
-Your sole job is to evaluate the Symmetric Shared Evidence Slate from a restraint and disruption-minimization perspective:
-  "If an AI suddenly chimed in publicly right now, would it interrupt healthy human flow, repeat what someone already said, prematurely jump into brainstorming, overstep authority, or leak/broadcast sensitive context in the wrong channel?"
+SKEPTIC_SYSTEM_PROMPT = """You are the SKEPTIC evaluator for a proactive workplace AI assistant, guarding against unnecessary interruptions, redundant replies, and overly public broadcasts.
+Your sole job is to evaluate the Symmetric Shared Evidence Slate from a calibrated restraint perspective:
+  "If an AI chimes in right now, would it violate a Veto Condition, repeat what a teammate already resolved, interrupt an explicit deferral or casual brainstorming flow, or broadcast sensitive context in too wide a channel?"
 
 Rules:
 1. Ground your evaluation STRICTLY in the provided Shared Evidence Slate. Cite exact msg_id / recon_id items.
-2. Explicitly check the `Veto Conditions` listed on the candidate Skill Contracts!
-3. Score `skeptic_score` in [0.00, 1.00] measuring: "How strongly does this evidence support waiting, staying silent, avoiding redundancy, or lowering intervention scope?"
-   - 0.00 - 0.25: Minimal disruption risk; humans are clearly stuck, wrong, or directly need missing verified facts.
-   - 0.26 - 0.50: Moderate caution; a brief thread or DM is fine, but a loud channel broadcast would feel intrusive.
-   - 0.51 - 0.75: High disruption or redundancy risk; humans are actively progressing, info is uncertain, or topic is sensitive.
-   - 0.76 - 1.00: Strong reason to stay SILENT; already answered/resolved, explicitly deferred, casual banter, or clear veto triggered.
+2. Explicitly check the `Vetos` listed on the candidate Skill Contracts!
+3. Score `skeptic_score` in [0.00, 1.00] using the FULL calibrated range (do NOT default to high skepticism when a real unresolved problem exists):
+   - 0.00 - 0.25: Minimal disruption risk — the slate shows an active unresolved question, verified discrepancy/failure in `[Recon]`, team blocker, or clear policy risk, AND NO `Veto` condition applies. Prefer `max_acceptable_channel = THREAD_BRIEF` or `CHANNEL_INTERVENE` (use `DM_NUDGE` only for private/sensitive 1-on-1 matters).
+   - 0.26 - 0.49: Mild caution — a real unresolved need exists so help is welcome, but keep scope focused (`DM_NUDGE` or `THREAD_BRIEF`) rather than broadcasting loudly to the whole channel.
+   - 0.50 - 0.74: High disruption or redundancy risk — humans are actively progressing on their own, brainstorming without verified errors, or evidence is too uncertain to interrupt.
+   - 0.75 - 1.00: Strong reason to stay SILENT — a `Veto` condition explicitly matches: a teammate already answered/resolved the issue accurately, an owner explicitly deferred it ("let's discuss later" / "I've got this"), casual banter, or clear scope/privacy boundary. Set `max_acceptable_channel = SILENT`.
 4. State `max_acceptable_channel` (`SILENT`, `DM_NUDGE`, `THREAD_BRIEF`, or `CHANNEL_INTERVENE`).
-5. Be honest and calibrated—do NOT fabricate disruption risk when the team is making a verified costly mistake. Return strict JSON only."""
+5. Be strictly calibrated: stay silent on genuine traps/vetos, and score <= 0.30 when verified evidence shows the team genuinely needs help. Return strict JSON only."""
 
 SKEPTIC_JSON_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -95,9 +96,43 @@ SKEPTIC_JSON_SCHEMA: dict[str, Any] = {
     },
 }
 
+# Mode-calibrated prompts for general multi-party group chats (When2Speak benchmark)
+WHEN2SPEAK_ADVOCATE_SYSTEM_PROMPT = """You are the ADVOCATE evaluator for a proactive AI assistant (`[AGENT]`) silently observing a multi-party group chat.
+Your sole job is to evaluate the Shared Evidence Slate — focusing strictly on the LATEST turn (`latest=...`) in context — from a helpfulness perspective:
+  "Does the latest turn raise an unanswered informational/lookup/recommendation question, factual uncertainty, memory lapse, misconception, or direct request to `[AGENT]` where speaking right now adds concrete, immediate value?"
+
+Rules:
+1. Ground your evaluation STRICTLY in the Shared Evidence Slate and cite exact msg_id items. Focus on whether `[AGENT]` should speak RIGHT NOW immediately after the latest turn.
+2. Score `advocate_score` in [0.00, 1.00] using the FULL calibrated range:
+   - 0.00 - 0.25: Ordinary human-to-human banter, reactions, agreements, personal anecdotes/opinions, polite thanks/closings with no new question, personal questions aimed at another human, or an earlier question already answered.
+   - 0.26 - 0.49: Casual topic discussion or human-to-human advice with no explicit question, memory lapse, or factual error.
+   - 0.50 - 0.74: Implicit knowledge gap, mild uncertainty, or open group decision where a brief factual suggestion might help.
+   - 0.75 - 1.00: Clear, direct reason for `[AGENT]` to speak right now — an unanswered open question to the group ("Does anyone know...", "Isn't there a...", "What was it called...", "Can anyone recommend..."), factual uncertainty/memory lapse, clear factual misconception, or direct question/request to `[AGENT]`.
+3. Select the closest `recommended_skill` (`find`, `explain`, `analyze`, `check`, `diagnose`, `decide`, `coordinate`, `guard`, or `none`).
+4. Set `minimum_effective_channel` (`THREAD_BRIEF` for normal group replies, `DM_NUDGE` for minor optional tips, `CHANNEL_INTERVENE` for direct/urgent factual answers).
+5. Be strictly calibrated: most human group-chat turns (~85%) do NOT need the AI to speak. Score <= 0.25 on normal human flow, and >= 0.75 on genuine unanswered questions or direct requests. Return strict JSON only."""
+
+WHEN2SPEAK_SKEPTIC_SYSTEM_PROMPT = """You are the SKEPTIC evaluator for a proactive AI assistant (`[AGENT]`) silently observing a multi-party group chat.
+Your sole job is to evaluate the Shared Evidence Slate — focusing strictly on the LATEST turn (`latest=...`) in context — from a restraint and conversational-flow perspective:
+  "If `[AGENT]` speaks right now after the latest turn, would it be an unwelcome interruption of natural human-to-human chat, redundant, or unnecessary?"
+
+Rules:
+1. Ground your evaluation STRICTLY in the Shared Evidence Slate and cite exact msg_id items.
+2. Score `skeptic_score` in [0.00, 1.00] using the FULL calibrated range (do NOT default to high scores when someone asks an open factual/lookup question!):
+   - 0.00 - 0.25: LOW disruption risk — the latest turn explicitly asks an unanswered factual/lookup/resource/recommendation question ("Does anyone know...", "What was it called...", "Isn't there a..."), expresses clear factual uncertainty/memory lapse, or directly asks `[AGENT]` for help. Speaking right now is genuinely welcome! Set `max_acceptable_channel = THREAD_BRIEF` or `CHANNEL_INTERVENE`.
+   - 0.26 - 0.49: Mild caution — an implicit factual gap or open question where a concise reply is acceptable (`DM_NUDGE` or `THREAD_BRIEF`).
+   - 0.50 - 0.74: High disruption risk — humans are exchanging personal opinions, tips, or anecdotes with each other without asking for external lookup or AI input.
+   - 0.75 - 1.00: STRONG reason to stay SILENT — pure social banter, jokes, reactions/agreements, personal stories, questions aimed at another human's personal experience, already-answered questions, or simple acknowledgments/closings with no new question. Set `max_acceptable_channel = SILENT`.
+3. List any matched restraint reasons in `matched_veto_conditions` (e.g., `["human_social_banter"]`, `["personal_opinion_exchange"]`, `["already_answered"]`, or `[]` if none).
+4. Be sharply calibrated across the full [0, 1] range: score >= 0.75 on ordinary human banter/flow, and <= 0.25 on genuine unanswered questions or direct `[AGENT]` requests. Return strict JSON only."""
+
 # Ablation A4: Single Combined Prompt
 SINGLE_COMBINED_GATE_SYSTEM_PROMPT = """You are a proactive workplace AI gate evaluator.
 Evaluate the Symmetric Shared Evidence Slate in a SINGLE pass, weighing BOTH the unresolved team need (advocate_score in [0,1]) AND the disruption/redundancy risk (skeptic_score in [0,1]).
+Return strict JSON only."""
+
+WHEN2SPEAK_SINGLE_COMBINED_GATE_SYSTEM_PROMPT = """You are a proactive group-chat AI gate evaluator monitoring a multi-party conversation (`[AGENT]`).
+Evaluate the Shared Evidence Slate in a SINGLE pass focusing on the LATEST turn, weighing BOTH the unanswered user need (advocate_score in [0,1]) AND the conversational disruption risk (skeptic_score in [0,1]).
 Return strict JSON only."""
 
 SINGLE_COMBINED_GATE_JSON_SCHEMA: dict[str, Any] = {
@@ -139,6 +174,14 @@ def compute_slate_hash(canonical_body: str) -> str:
     return hashlib.sha256(canonical_body.encode("utf-8")).hexdigest()
 
 
+_STANCE_SHORT: dict[str, str] = {
+    "need_signal": "need",
+    "defer_or_resolved_signal": "defer",
+    "scope_risk_signal": "scope",
+    "background_chatter": "chat",
+}
+
+
 def render_shared_evidence_slate(
     *,
     channel_name: str,
@@ -150,51 +193,54 @@ def render_shared_evidence_slate(
     skill_priors: dict[SkillName, float],
     candidate_skills: list[SkillCard],
 ) -> tuple[str, str]:
-    """Render canonical SHARED_EVIDENCE_SLATE text and deterministic SHA-256 slate_hash."""
+    """Render compact canonical SHARED_EVIDENCE_SLATE text and deterministic SHA-256 slate_hash."""
     body_lines: list[str] = [
-        f"Channel: {channel_name} | Mode: {env_mode} | Latest Turn: {latest_msg_id}",
-        "",
-        "[Filtered & Annotated Dialogue Evidence]",
+        f"ch={channel_name} mode={env_mode} latest={latest_msg_id}",
+        "[Evidence]",
     ]
     for msg in selected_messages:
-        body_lines.append(f"- [{msg.msg_id}] {msg.speaker}: {msg.text}")
         ann = triage_annotations.get(msg.msg_id)
         if ann is not None:
-            body_lines.append(
-                f"  (triage: p_chg={ann.p_decision_change:.2f}, stance={ann.stance}, "
-                f"skill={ann.skill_hint}, urgency={ann.urgency_score:.2f})"
-            )
+            st_short = _STANCE_SHORT.get(ann.stance, ann.stance)
+            if env_mode == "when2speak":
+                tag = f"{msg.msg_id}|p={ann.p_decision_change:.2f}|{st_short}"
+            else:
+                tag = f"{msg.msg_id}|p={ann.p_decision_change:.2f}|{st_short}|{ann.skill_hint}"
+        else:
+            tag = msg.msg_id
+        body_lines.append(f"- [{tag}] {msg.speaker}: {msg.text}")
 
     if recon_items:
-        body_lines.append("")
-        body_lines.append("[Verified Enterprise Silent-Recon Evidence]")
+        body_lines.append("[Recon]")
         for item in recon_items:
             body_lines.append(f"- [{item.recon_id}] ({item.service}): {item.summary_fact}")
 
     if candidate_skills:
-        body_lines.append("")
-        body_lines.append("[Top Candidate Skill Contracts]")
-        for idx, card in enumerate(candidate_skills, start=1):
+        body_lines.append("[Skills]")
+        for card in candidate_skills:
             prior = float(skill_priors.get(card.name, 0.0))
-            body_lines.append(f"Skill {idx}: {card.name} (prior={prior:.2f})")
-            body_lines.append(f"  - Trigger Conditions: {card.trigger_conditions}")
-            body_lines.append(f"  - Veto Conditions: {card.veto_conditions}")
+            triggers = "; ".join(card.trigger_conditions)
+            vetos = "; ".join(card.veto_conditions)
             body_lines.append(
-                f"  - Channel Policy: default={card.channel_policy.default_tier.value}, "
-                f"max={card.channel_policy.max_tier.value}"
+                f"- {card.name} (p={prior:.2f}, tier={card.channel_policy.default_tier.value}/{card.channel_policy.max_tier.value})"
             )
+            body_lines.append(f"  Triggers: {triggers}")
+            body_lines.append(f"  Vetos: {vetos}")
 
     canonical_body = "\n".join(body_lines)
     slate_hash = compute_slate_hash(canonical_body)
-    header = f"=== SYMMETRIC SHARED EVIDENCE SLATE (hash: {slate_hash[:12]}) ==="
-    footer = "=================================================================="
-    canonical_text = f"{header}\n{canonical_body}\n{footer}"
+    canonical_text = f"SLATE[{slate_hash[:12]}]\n{canonical_body}"
     return canonical_text, slate_hash
 
 
-def build_advocate_messages(canonical_slate_text: str) -> list[dict[str, str]]:
+def build_advocate_messages(
+    canonical_slate_text: str, env_mode: str = "pagemantle"
+) -> list[dict[str, str]]:
+    sys_prompt = (
+        WHEN2SPEAK_ADVOCATE_SYSTEM_PROMPT if env_mode == "when2speak" else ADVOCATE_SYSTEM_PROMPT
+    )
     return [
-        {"role": "system", "content": ADVOCATE_SYSTEM_PROMPT},
+        {"role": "system", "content": sys_prompt},
         {
             "role": "user",
             "content": f"Evaluate the following Shared Evidence Slate as ADVOCATE:\n\n{canonical_slate_text}",
@@ -202,9 +248,14 @@ def build_advocate_messages(canonical_slate_text: str) -> list[dict[str, str]]:
     ]
 
 
-def build_skeptic_messages(canonical_slate_text: str) -> list[dict[str, str]]:
+def build_skeptic_messages(
+    canonical_slate_text: str, env_mode: str = "pagemantle"
+) -> list[dict[str, str]]:
+    sys_prompt = (
+        WHEN2SPEAK_SKEPTIC_SYSTEM_PROMPT if env_mode == "when2speak" else SKEPTIC_SYSTEM_PROMPT
+    )
     return [
-        {"role": "system", "content": SKEPTIC_SYSTEM_PROMPT},
+        {"role": "system", "content": sys_prompt},
         {
             "role": "user",
             "content": f"Evaluate the following Shared Evidence Slate as SKEPTIC:\n\n{canonical_slate_text}",
@@ -212,9 +263,16 @@ def build_skeptic_messages(canonical_slate_text: str) -> list[dict[str, str]]:
     ]
 
 
-def build_single_combined_messages(canonical_slate_text: str) -> list[dict[str, str]]:
+def build_single_combined_messages(
+    canonical_slate_text: str, env_mode: str = "pagemantle"
+) -> list[dict[str, str]]:
+    sys_prompt = (
+        WHEN2SPEAK_SINGLE_COMBINED_GATE_SYSTEM_PROMPT
+        if env_mode == "when2speak"
+        else SINGLE_COMBINED_GATE_SYSTEM_PROMPT
+    )
     return [
-        {"role": "system", "content": SINGLE_COMBINED_GATE_SYSTEM_PROMPT},
+        {"role": "system", "content": sys_prompt},
         {
             "role": "user",
             "content": f"Evaluate the following Shared Evidence Slate:\n\n{canonical_slate_text}",

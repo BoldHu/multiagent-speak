@@ -197,7 +197,7 @@ class DialecticGate:
     async def _run_advocate(self, slate: SharedEvidenceSlate) -> tuple[AdvocateOutput, LLMCallResult]:
         res = await self.openai_client.complete_json(
             model=self.gate_model,
-            messages=build_advocate_messages(slate.canonical_text),
+            messages=build_advocate_messages(slate.canonical_text, env_mode=slate.env_mode),
             json_schema=ADVOCATE_JSON_SCHEMA,
             schema_name="dial_skill_advocate",
             temperature=self.cfg.gate.temperature,
@@ -217,7 +217,7 @@ class DialecticGate:
     async def _run_skeptic(self, slate: SharedEvidenceSlate) -> tuple[SkepticOutput, LLMCallResult]:
         res = await self.openai_client.complete_json(
             model=self.gate_model,
-            messages=build_skeptic_messages(slate.canonical_text),
+            messages=build_skeptic_messages(slate.canonical_text, env_mode=slate.env_mode),
             json_schema=SKEPTIC_JSON_SCHEMA,
             schema_name="dial_skill_skeptic",
             temperature=self.cfg.gate.temperature,
@@ -239,7 +239,7 @@ class DialecticGate:
     ) -> tuple[AdvocateOutput, SkepticOutput, LLMCallResult]:
         res = await self.openai_client.complete_json(
             model=self.gate_model,
-            messages=build_single_combined_messages(slate.canonical_text),
+            messages=build_single_combined_messages(slate.canonical_text, env_mode=slate.env_mode),
             json_schema=SINGLE_COMBINED_GATE_JSON_SCHEMA,
             schema_name="dial_skill_single_combined",
             temperature=self.cfg.gate.temperature,

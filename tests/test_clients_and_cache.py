@@ -212,20 +212,25 @@ def test_jev_client_success_caching_and_graceful_fallback(tmp_path: Path) -> Non
     http_ok = httpx.AsyncClient(transport=httpx.MockTransport(_jev_ok_handler))
     tc_ok = TriageClient(cache=cache, jev_api_key="fake-jev", http_client=http_ok)
 
-    async def _run_ok() -> tuple[Any, Any]:
+    async def _run_ok() -> tuple[Any, Any, Any]:
         t1 = await tc_ok.score_message("#billing", [], msg)
         t2 = await tc_ok.score_message("#billing", [], msg)
+        # Sliding-window msg_id shift with identical content MUST hit cache and bind new msg_id!
+        shifted_msg = msg.model_copy(update={"msg_id": "m_shifted_99"})
+        t3 = await tc_ok.score_message("#billing", [], shifted_msg)
         await http_ok.aclose()
-        return t1, t2
+        return t1, t2, t3
 
-    t1, t2 = asyncio.run(_run_ok())
+    t1, t2, t3 = asyncio.run(_run_ok())
     assert t1.backend == "jev"
     assert t1.stance == "need_signal"
     assert t1.skill_hint == "diagnose"
     assert abs(t1.p_decision_change - 0.88) < 1e-6
     assert t2 == t1
+    assert t3.msg_id == "m_shifted_99"
+    assert abs(t3.p_decision_change - t1.p_decision_change) < 1e-6
     assert jev_calls["n"] == 1
-    assert tc_ok.cache_hits == 1
+    assert tc_ok.cache_hits == 2
 
     # 2. Mocked Jev HTTP 402 quota exhaustion -> graceful OpenAI Luna fallback (Invariant #5)
     fallback_json = json.dumps(

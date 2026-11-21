@@ -555,3 +555,81 @@ def test_all_seven_ablation_switches_work_cleanly(tmp_path: Path) -> None:
             assert ep.gate.final_tier == InterventionTier.THREAD_BRIEF  # U_t=0.58 NOT de-escalated!
         elif tag == "A7":
             assert ep.gate.selected_skill == "none"
+
+
+def test_when2speak_mode_prompt_dispatch_chatter_pruning_and_compression(tmp_path: Path) -> None:
+    """Verify when2speak mode omits SaaS skill cards, prunes chatter, achieves >=40% compression, and uses group-chat prompts."""
+    messages = [
+        ChatMessage(
+            msg_id=f"m_{i}",
+            speaker=f"Speaker_{i % 3}",
+            text=f"Just casual group banter turn {i} talking about weekend plans and weather outside.",
+        )
+        for i in range(8)
+    ]
+    messages[2].text = "I heard about an open-source citation tool earlier, forgot its name."
+    messages[7].text = "Does anyone know what that citation manager was called, Zotero or something?"
+
+    scores = {
+        "m_2": {
+            "p_chg": 0.72,
+            "stance": "need_signal",
+            "stance_probs": {
+                "need_signal": 0.75,
+                "defer_or_resolved_signal": 0.10,
+                "scope_risk_signal": 0.05,
+                "background_chatter": 0.10,
+            },
+            "skill": "find",
+            "urgency": 0.5,
+        },
+        "m_7": {
+            "p_chg": 0.85,
+            "stance": "need_signal",
+            "stance_probs": {
+                "need_signal": 0.85,
+                "defer_or_resolved_signal": 0.05,
+                "scope_risk_signal": 0.02,
+                "background_chatter": 0.08,
+            },
+            "skill": "find",
+            "urgency": 0.7,
+        },
+    }
+    tc, http = _make_jev_mock_client(scores, tmp_path / "w2s_jev.sqlite")
+    fake_oai = _RoleAwareFakeOpenAI()
+    oai = OpenAIClient(api_key="k", cache=SQLiteAPICache(tmp_path / "w2s_oai.sqlite"), async_client=fake_oai)
+    agent = DialSkillAgent(
+        triage_client=tc,
+        openai_client=oai,
+        gate_model="gpt-6-luna",
+        executor_model="gpt-6.1-terra",
+    )
+
+    async def _run() -> Any:
+        ep = await agent.run_episode(
+            sample_id="w2s_comp_1",
+            conversation_id="w2s_c1",
+            channel_name="#group-chat",
+            messages=messages,
+            benchmark="when2speak",
+            generate_text=False,
+            include_slate_in_metadata=True,
+        )
+        await http.aclose()
+        return ep
+
+    ep = asyncio.run(_run())
+    slate_meta = ep.metadata["slate"]
+    # Enterprise SaaS skill cards must NOT bloat When2Speak slates
+    assert slate_meta["candidate_skills"] == []
+    # Low-VoI chatter turns pruned; only m_2 (need) + pinned m_6, m_7 retained
+    selected_ids = [m["msg_id"] for m in slate_meta["selected_messages"]]
+    assert selected_ids == ["m_2", "m_6", "m_7"]
+    # Token reduction on 8-turn chat comfortably exceeds 40%
+    reduction = 1.0 - (ep.prompt_tokens_slate / max(1, ep.prompt_tokens_raw))
+    assert reduction >= 0.40, f"Expected >=40% token reduction, got {reduction:.2%}"
+    # Verify Stage-2 prompts received When2Speak group-chat prompt (not enterprise SaaS prompt)
+    assert len(fake_oai.seen_prompts) == 2
+    assert all("[Skills]" not in user_msg for _, user_msg in fake_oai.seen_prompts)
+

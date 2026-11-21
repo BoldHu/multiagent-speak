@@ -390,3 +390,57 @@ def test_reflexion_and_awm_online_baselines(tmp_path: Path) -> None:
     asyncio.run(awm.process_episode(ep, fb))
     assert len(awm.workflows) == 1
     assert awm.estimate_memory_tokens() > 0
+
+
+def test_dbcse_targets_affected_skill_for_numeric_and_escrow_replay(tmp_path: Path) -> None:
+    """Numeric updates AND EscrowGate replay must target attribution.affected_skill even when absent from slate."""
+    store = SkillStore.from_json_file()
+    new_trigger = "Intervene when a teammate cites an unverified metric that contradicts warehouse records."
+    fake = _FakeCriticOpenAI(
+        attribution={
+            "root_cause": "TRIGGER_MISSING",
+            "affected_skill": "check",
+            "counterfactual_explanation": "Verification trigger belongs on check skill.",
+            "needs_symbolic_patch": True,
+        },
+        proposal={
+            "target_field": "trigger_conditions",
+            "proposed_predicate": new_trigger,
+            "rationale": "Catch unverified claims.",
+        },
+    )
+    oai = OpenAIClient(api_key="k", cache=SQLiteAPICache(tmp_path / "aff.sqlite"), async_client=fake)
+    updater = DBCSEUpdater(skill_store=store, openai_client=oai, critic_model="gpt-6.1-terra")
+
+    # Original slate only had `find` in candidate_skills, NOT `check`!
+    slate = _make_slate(store, "find", "SLATE_WITHOUT_CHECK")
+    gate = _make_gate(InterventionTier.SILENT, -0.05, "find")
+    fb = EpisodeFeedback(
+        sample_id="fn_mismatch",
+        skill_name="find",
+        feedback_type="FN_OMISSION",
+        critique="Missed factual check.",
+        expected_speak=True,
+        expected_tier=InterventionTier.THREAD_BRIEF,
+        predicted_tier=InterventionTier.SILENT,
+    )
+
+    seen_candidate_names: list[list[str]] = []
+
+    async def _rescore(sl: SharedEvidenceSlate, cand: SkillStore) -> GateDecision:
+        seen_candidate_names.append([c.name for c in sl.candidate_skills])
+        # Verify the newly patched `check` skill is visible during replay!
+        assert any(c.name == "check" and new_trigger in c.trigger_conditions for c in sl.candidate_skills)
+        return _make_gate(InterventionTier.THREAD_BRIEF, 0.25, "check")
+
+    entry = asyncio.run(
+        updater.process_episode(slate=slate, gate=gate, feedback=fb, rescore_fn=_rescore)
+    )
+    assert entry.promoted is True
+    assert entry.skill_name == "check"
+    # Numeric update MUST have landed on `check`, NOT on `find`!
+    assert store.require("find").margin_offset == 0.0
+    assert store.require("check").margin_offset == -0.06
+    assert new_trigger in store.require("check").trigger_conditions
+    assert seen_candidate_names == [["find", "check"]]
+

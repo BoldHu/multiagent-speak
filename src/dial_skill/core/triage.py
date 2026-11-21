@@ -75,6 +75,7 @@ def _pick_top_candidate_skills(
     skill_priors: dict[SkillName, float],
     skill_store: SkillStore,
     top_k: int = 2,
+    second_prior_floor: float = 0.20,
 ) -> list[SkillCard]:
     ranked = sorted(
         ACTIVE_SKILLS,
@@ -82,7 +83,9 @@ def _pick_top_candidate_skills(
         reverse=True,
     )
     cards: list[SkillCard] = []
-    for name in ranked[:top_k]:
+    for pos, name in enumerate(ranked[:top_k]):
+        if pos > 0 and float(skill_priors.get(name, 0.0)) < second_prior_floor:
+            continue
         card = skill_store.get(name)
         if card is not None:
             cards.append(card)
@@ -129,18 +132,37 @@ class TriageStage:
         self,
         messages: list[ChatMessage],
         annotations: dict[str, TriageItem],
+        env_mode: Literal["when2speak", "pagemantle"] = "pagemantle",
     ) -> list[int]:
-        """Select <= K_slate turns retaining BOTH need_signal AND defer/scope signals (Invariant #2)."""
+        """Select <= K_slate turns, pruning low-VoI chatter while retaining BOTH need AND defer/scope signals (Invariant #2)."""
         n = len(messages)
-        k_slate = max(2, self.cfg.triage.k_slate)
-        if n <= k_slate:
+        if n <= 2:
             return list(range(n))
+
+        k_base = max(2, self.cfg.triage.k_slate)
+        # In compact group chats (When2Speak), cap at 4 turns (2 pinned + 1 need + 1 defer/scope)
+        k_eff = min(k_base, 4) if env_mode == "when2speak" else k_base
 
         # Always include latest 2 turns for immediate conversational continuity
         pinned = {n - 2, n - 1}
         older_indices = list(range(0, n - 2))
 
-        budget_rem = k_slate - len(pinned)
+        # Prune low-VoI background chatter from older turns so Stage-1 genuinely compresses noise
+        older_informative = [
+            i
+            for i in older_indices
+            if annotations[messages[i].msg_id].stance != "background_chatter"
+            or annotations[messages[i].msg_id].p_decision_change >= 0.35
+        ]
+        if not older_informative:
+            return sorted(pinned)
+
+        budget_rem = max(0, k_eff - len(pinned))
+        if budget_rem == 0:
+            return sorted(pinned)
+        if len(older_informative) <= budget_rem:
+            return sorted(pinned | set(older_informative))
+
         need_quota = budget_rem // 2
         defer_quota = budget_rem - need_quota
 
@@ -155,8 +177,8 @@ class TriageStage:
                 + float(ann.stance_probs.get("scope_risk_signal", 0.0))
             )
 
-        need_ranked = sorted(older_indices, key=_need_score, reverse=True)
-        defer_ranked = sorted(older_indices, key=_defer_scope_score, reverse=True)
+        need_ranked = sorted(older_informative, key=_need_score, reverse=True)
+        defer_ranked = sorted(older_informative, key=_defer_scope_score, reverse=True)
 
         selected: set[int] = set(pinned)
 
@@ -188,11 +210,13 @@ class TriageStage:
         messages: list[ChatMessage],
         annotations: dict[str, TriageItem],
         side: Literal["advocate", "skeptic"],
+        env_mode: Literal["when2speak", "pagemantle"] = "pagemantle",
     ) -> list[int]:
         """Ablation A3 ONLY: construct an asymmetric view biased toward one side."""
         n = len(messages)
-        k_slate = max(2, self.cfg.triage.k_slate)
-        if n <= k_slate:
+        k_base = max(2, self.cfg.triage.k_slate)
+        k_eff = min(k_base, 4) if env_mode == "when2speak" else k_base
+        if n <= k_eff:
             return list(range(n))
         pinned = {n - 2, n - 1}
         older = list(range(0, n - 2))
@@ -215,7 +239,7 @@ class TriageStage:
             )
         chosen = set(pinned)
         for idx in ranked:
-            if len(chosen) >= k_slate:
+            if len(chosen) >= k_eff:
                 break
             chosen.add(idx)
         return sorted(chosen)
@@ -249,9 +273,10 @@ class TriageStage:
         else:
             skill_priors = _uniform_skill_priors()
 
+        # Enterprise SaaS Skill Contracts apply in PageMantle mode only (avoids domain mismatch & bloat on When2Speak)
         candidate_skills = (
             []
-            if self.cfg.ablation.disable_skill_routing
+            if (self.cfg.ablation.disable_skill_routing or env_mode == "when2speak")
             else _pick_top_candidate_skills(skill_priors, skill_store, top_k=2)
         )
 
@@ -353,7 +378,7 @@ class TriageStage:
             and max_window_need < self.cfg.triage.theta_need
         )
 
-        balanced_indices = self._select_balanced_indices(messages, annotations)
+        balanced_indices = self._select_balanced_indices(messages, annotations, env_mode=env_mode)
         slate = self._build_slate(
             conversation_id=conversation_id,
             channel_name=channel_name,
@@ -366,8 +391,12 @@ class TriageStage:
 
         # Invariant #1: Advocate and Skeptic get the EXACT SAME slate unless Ablation A3 is active!
         if self.cfg.ablation.asymmetric_evidence:
-            adv_idx = self._select_asymmetric_indices(messages, annotations, side="advocate")
-            skep_idx = self._select_asymmetric_indices(messages, annotations, side="skeptic")
+            adv_idx = self._select_asymmetric_indices(
+                messages, annotations, side="advocate", env_mode=env_mode
+            )
+            skep_idx = self._select_asymmetric_indices(
+                messages, annotations, side="skeptic", env_mode=env_mode
+            )
             adv_slate = self._build_slate(
                 conversation_id=conversation_id,
                 channel_name=channel_name,
@@ -397,6 +426,6 @@ class TriageStage:
             skeptic_slate=skep_slate,
             all_triage_items=annotations,
             prompt_tokens_raw=prompt_tokens_raw,
-            prompt_tokens_slate=estimate_tokens(slate.canonical_text),
+            prompt_tokens_slate=0 if short_circuited else estimate_tokens(slate.canonical_text),
             triage_backend_used=triage_backend_used,
         )

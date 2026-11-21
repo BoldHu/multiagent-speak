@@ -179,6 +179,24 @@ def build_jev_state_payload(
     }
 
 
+def build_jev_cache_key_payload(
+    channel_name: str,
+    prior_messages: list[ChatMessage],
+    target_message: ChatMessage,
+) -> dict[str, Any]:
+    """Content-only cache payload stripping synthetic msg_id so sliding windows hit cache across turns."""
+    window = prior_messages[-2:]
+    return {
+        "channel": channel_name,
+        "context_window": [{"speaker": m.speaker, "text": m.text} for m in window],
+        "target_message": {
+            "speaker": target_message.speaker,
+            "timestamp": target_message.timestamp,
+            "text": target_message.text,
+        },
+    }
+
+
 def _clamp01(value: float) -> float:
     return max(0.0, min(1.0, float(value)))
 
@@ -535,10 +553,12 @@ class TriageClient:
             return item
 
         state_payload = build_jev_state_payload(channel_name, prior_messages, target_message)
+        cache_payload = build_jev_cache_key_payload(channel_name, prior_messages, target_message)
         jev_model = self.models_cfg.jev.model
-        prompt_hash = compute_prompt_hash({"state": state_payload, "questions": _JEV_QUESTION_SPEC})
+        prompt_hash = compute_prompt_hash({"state": cache_payload, "questions": _JEV_QUESTION_SPEC})
+        legacy_hash = compute_prompt_hash({"state": state_payload, "questions": _JEV_QUESTION_SPEC})
 
-        # 1. Check persistent SQLite cache first
+        # 1. Check persistent SQLite cache first (content-based key, then legacy msg_id key for backward reuse)
         cached = self.cache.get(
             provider="jev",
             model=jev_model,
@@ -546,9 +566,27 @@ class TriageClient:
             temperature=0.0,
             seed=self.seed,
         )
+        if cached is None:
+            cached = self.cache.get(
+                provider="jev",
+                model=jev_model,
+                prompt_hash=legacy_hash,
+                temperature=0.0,
+                seed=self.seed,
+            )
+            if cached is not None:
+                # Backfill content-based key so future sliding-window turns hit directly
+                self.cache.set(
+                    provider="jev",
+                    model=jev_model,
+                    prompt_hash=prompt_hash,
+                    temperature=0.0,
+                    seed=self.seed,
+                    response=cached,
+                )
         if cached is not None:
             self.cache_hits += 1
-            return TriageItem.model_validate(cached)
+            return TriageItem.model_validate(cached).model_copy(update={"msg_id": target_message.msg_id})
 
         # 2. If circuit breaker tripped (e.g., quota exhausted / auth error / missing key), fall back cleanly
         if self._jev_circuit_open_reason is not None:
