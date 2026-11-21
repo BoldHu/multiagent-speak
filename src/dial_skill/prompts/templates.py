@@ -106,7 +106,9 @@ Rules:
 2. Respect multi-party turn-taking & temporal depth (`turns=` and `speakers=` in the header):
    - OPENING / VERY EARLY FLOOR (`turns <= 2` or `speakers <= 1`, unless `[AGENT]` is explicitly named): Humans have NOT yet had a chance to respond to each other! Even if `Speaker_0` asks `"Hey everyone, can someone help / does anyone know...?"`, the AI MUST let humans speak first -> score `0.05 - 0.20`.
    - EARLY ACTIVE HUMAN FLOW (`turns = 3..4`, unless `[AGENT]` is explicitly named): Humans are just starting to share ideas/suggestions -> keep `advocate_score <= 0.35` unless there is a clear factual error needing urgent correction.
-   - DIRECT `[AGENT]` ADDRESS (any turn depth where the latest message explicitly names `[AGENT]`, including questions, follow-ups, or polite thanks like `"Thanks [AGENT]"`): Direct social/informational address warrants a response -> score `0.75 - 0.95`.
+   - DIRECT `[AGENT]` REQUEST vs. PASSIVE ACKNOWLEDGMENT:
+     * If the latest turn explicitly asks `[AGENT]` a **new unanswered question** or requests `[AGENT]` to explain/check/recommend something -> score `0.80 - 0.95`.
+     * If `[AGENT]` already spoke earlier (`agent_turns >= 1`) and the latest turn is merely **thanking or agreeing with `[AGENT]`** (`"Thanks [AGENT]"`, `"That makes sense [AGENT]"`, `"[AGENT] makes a good point"`) with **NO new question** -> do NOT double-text; score `0.05 - 0.20`!
    - MATURE MULTI-PARTY DISCUSSION (`turns >= 5`, multiple speakers engaged): Evaluate all 5 high-value multi-party contribution opportunities:
      (a) **Synthesis & Reframing**: After multiple speakers share perspectives, dilemmas, or balanced reflections, concisely synthesizing or adding a framing insight (`0.65 - 0.88`).
      (b) **Data Provision / Source Identification**: Providing concrete facts, tactics, resources, or sources after humans have traded guesses or asked for a definitive answer (`0.72 - 0.95`).
@@ -126,10 +128,10 @@ Rules:
    - **0.85 - 0.98 (`SILENT`) — Opening / Early-Floor Restraint**: Whenever `turns <= 2` (especially `turns == 1` opening post!) or `speakers <= 1` AND `[AGENT]` is NOT explicitly named, score `>= 0.85` and `max_acceptable_channel = SILENT` — EVEN IF `Speaker_0` asks `"Hey everyone, can anyone help?"`, because the AI must give human participants space to reply first!
    - **0.65 - 0.84 (`SILENT`) — Active Early Human Back-and-Forth**: When `turns = 3..4` and humans are actively offering suggestions to each other without naming `[AGENT]` or stalling, wait for human dialogue to mature.
    - **0.05 - 0.25 (`THREAD_BRIEF` or `CHANNEL_INTERVENE`) — Low Disruption Risk**:
-     * Latest turn explicitly mentions/addresses `[AGENT]` (including `"Thanks [AGENT]"` or a direct question).
+     * Latest turn explicitly asks `[AGENT]` a **new unanswered question or request** (NOT merely thanking or praising `[AGENT]`'s earlier comment!).
      * Mature discussion (`turns >= 6`, multi-speaker) where the latest turn reaches a clear synthesis moment, open conceptual puzzle, competing viewpoints, unresolved practical tactic, or explicit uncertainty where a concise `[AGENT]` contribution (**Synthesis & Reframing**, **Data Provision**, **Source Identification**, **Concept Definition**, or **Factual Correction**) naturally enriches the thread.
    - **0.30 - 0.55 (`DM_NUDGE` or `THREAD_BRIEF`) — Mild Caution**: `turns >= 5` with a moderately substantive turn where a brief insight might help, though humans could also continue alone.
-   - **0.70 - 0.95 (`SILENT`) — Late-Turn Restraint**: Even when `turns >= 5`, score high skepticism if the latest turn is pure casual filler, a direct personal question to a specific human's life, or an active human reply that already fully answered the point with nothing left to synthesize.
+   - **0.70 - 0.95 (`SILENT`) — Late-Turn & Post-Agent Restraint**: Score high skepticism if (a) `[AGENT]` already spoke (`agent_turns >= 1`) and the human is simply thanking or referencing `[AGENT]` (`"Thanks [AGENT]"`, `"That makes sense [AGENT]"`, `"[AGENT] brings up a good point"`) with NO new question, (b) the latest turn is pure casual filler/logistics (`"I'll call them tomorrow"`), or (c) an active human reply already fully answered the point with nothing left to synthesize.
 3. List matched restraint reasons in `matched_veto_conditions` (e.g., `["opening_turn_let_humans_respond"]`, `["early_human_exchange"]`, `["casual_filler"]`, or `[]`).
 4. Be sharply calibrated across the full [0, 1] range. Return strict JSON only."""
 
