@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import Literal
 
@@ -316,18 +317,22 @@ class TriageStage:
             )
 
         backend_override = self.cfg.ablation.triage_backend_override
-        annotations: dict[str, TriageItem] = {}
-        backends_seen: set[str] = set()
-        for idx, msg in enumerate(messages):
+        sem = asyncio.Semaphore(8)
+
+        async def _score_one(idx: int, msg: ChatMessage) -> tuple[str, TriageItem]:
             prior = messages[max(0, idx - 2) : idx]
-            item = await self.triage_client.score_message(
-                channel_name=channel_name,
-                prior_messages=prior,
-                target_message=msg,
-                backend_override=backend_override,
-            )
-            annotations[msg.msg_id] = item
-            backends_seen.add(item.backend)
+            async with sem:
+                item = await self.triage_client.score_message(
+                    channel_name=channel_name,
+                    prior_messages=prior,
+                    target_message=msg,
+                    backend_override=backend_override,
+                )
+            return msg.msg_id, item
+
+        scored_pairs = await asyncio.gather(*(_score_one(i, m) for i, m in enumerate(messages)))
+        annotations: dict[str, TriageItem] = dict(scored_pairs)
+        backends_seen: set[str] = {item.backend for _, item in scored_pairs}
 
         triage_backend_used = (
             "openai_fallback"

@@ -5,12 +5,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, Sequence
 
 import typer
 from sklearn.metrics import f1_score
+from tqdm.auto import tqdm
 
 from dial_skill.baselines.direct_chat import DirectChatBaseline
 from dial_skill.baselines.proact import ProACTBaseline
@@ -172,27 +174,56 @@ async def run_when2speak_eval(
     output_jsonl: str | Path,
     resume: bool = True,
     generate_text: bool = False,
+    max_concurrency: int = 8,
+    show_progress: bool = True,
 ) -> list[EpisodeResult]:
-    """Run When2Speak evaluation with atomic Drive JSONL checkpointing & idempotent --resume."""
+    """Run When2Speak evaluation with conversation-parallel concurrency, live tqdm, and atomic --resume.
+
+    Conversations run concurrently (up to `max_concurrency`), while turns within each conversation run
+    in chronological order so Stage-1 prefix turns hit SQLite cache deterministically with zero waste.
+    """
     out_path = Path(output_jsonl)
     writer = JsonlCheckpointWriter(out_path)
     completed = load_completed_ids(out_path, id_field="sample_id") if resume else set()
 
+    pending_by_conv: dict[str, list[When2SpeakTurn]] = defaultdict(list)
     for turn in turns:
-        if turn.sample_id in completed:
-            continue
-        kwargs: dict[str, Any] = {
-            "sample_id": turn.sample_id,
-            "conversation_id": turn.conversation_id,
-            "channel_name": turn.messages[-1].channel if turn.messages else "#group-chat",
-            "messages": turn.messages,
-            "benchmark": "when2speak",
-        }
-        if not isinstance(agent, DirectChatBaseline):
-            kwargs["generate_text"] = generate_text
-        ep = await agent.run_episode(**kwargs)
-        writer.append(ep)
-        completed.add(turn.sample_id)
+        if turn.sample_id not in completed:
+            pending_by_conv[turn.conversation_id].append(turn)
+
+    total_pending = sum(len(v) for v in pending_by_conv.values())
+    pbar = tqdm(
+        total=len(turns),
+        initial=len(turns) - total_pending,
+        desc=f"W2S[{out_path.stem}]",
+        disable=not show_progress,
+    )
+    sem = asyncio.Semaphore(max(1, max_concurrency))
+    write_lock = asyncio.Lock()
+
+    async def _run_conv(conv_turns: list[When2SpeakTurn]) -> None:
+        async with sem:
+            for turn in conv_turns:
+                kwargs: dict[str, Any] = {
+                    "sample_id": turn.sample_id,
+                    "conversation_id": turn.conversation_id,
+                    "channel_name": turn.messages[-1].channel if turn.messages else "#group-chat",
+                    "messages": turn.messages,
+                    "benchmark": "when2speak",
+                }
+                if not isinstance(agent, DirectChatBaseline):
+                    kwargs["generate_text"] = generate_text
+                ep = await agent.run_episode(**kwargs)
+                async with write_lock:
+                    writer.append(ep)
+                    completed.add(turn.sample_id)
+                    pbar.update(1)
+
+    try:
+        if pending_by_conv:
+            await asyncio.gather(*(_run_conv(cturns) for cturns in pending_by_conv.values()))
+    finally:
+        pbar.close()
 
     # Return ordered predictions matching turns
     by_id = {
@@ -211,36 +242,47 @@ async def run_pagemantle_eval(
     output_jsonl: str | Path,
     resume: bool = True,
     include_slate_in_metadata: bool = False,
+    show_progress: bool = True,
 ) -> list[EpisodeResult]:
-    """Run PageMantle evaluation with tool-budget reset, atomic checkpointing, and --resume."""
+    """Run PageMantle evaluation with tool-budget reset, live tqdm, atomic checkpointing, and --resume."""
     out_path = Path(output_jsonl)
     writer = JsonlCheckpointWriter(out_path)
     completed = load_completed_ids(out_path, id_field="sample_id") if resume else set()
 
-    for task in tasks:
-        if task.task_id in completed:
-            continue
-        env.reset_budget()
-        benchmark_tag: Literal["pagemantle_official", "pagemantle_ext"] = (
-            "pagemantle_official" if task.split == "pm_official_8" else "pagemantle_ext"
-        )
-        kwargs: dict[str, Any] = {
-            "sample_id": task.task_id,
-            "conversation_id": task.task_id,
-            "channel_name": task.channel_name,
-            "messages": task.messages,
-            "benchmark": benchmark_tag,
-            "tool_env": env,
-        }
-        if isinstance(agent, DialSkillAgent):
-            kwargs["generate_text"] = True
-            kwargs["include_slate_in_metadata"] = include_slate_in_metadata
-        elif not isinstance(agent, DirectChatBaseline):
-            kwargs["generate_text"] = True
+    pending = [t for t in tasks if t.task_id not in completed]
+    pbar = tqdm(
+        total=len(tasks),
+        initial=len(tasks) - len(pending),
+        desc=f"PM[{out_path.stem}]",
+        disable=not show_progress,
+    )
+    try:
+        for task in pending:
+            env.reset_budget()
+            benchmark_tag: Literal["pagemantle_official", "pagemantle_ext"] = (
+                "pagemantle_official" if task.split == "pm_official_8" else "pagemantle_ext"
+            )
+            kwargs: dict[str, Any] = {
+                "sample_id": task.task_id,
+                "conversation_id": task.task_id,
+                "channel_name": task.channel_name,
+                "messages": task.messages,
+                "benchmark": benchmark_tag,
+                "tool_env": env,
+            }
+            if isinstance(agent, DialSkillAgent):
+                kwargs["generate_text"] = True
+                kwargs["include_slate_in_metadata"] = include_slate_in_metadata
+            elif not isinstance(agent, DirectChatBaseline):
+                kwargs["generate_text"] = True
 
-        ep = await agent.run_episode(**kwargs)
-        writer.append(ep)
-        completed.add(task.task_id)
+            ep = await agent.run_episode(**kwargs)
+            writer.append(ep)
+            completed.add(task.task_id)
+            pbar.set_postfix(task=task.task_id, tier=ep.gate.final_tier.value)
+            pbar.update(1)
+    finally:
+        pbar.close()
 
     by_id = {
         row["sample_id"]: EpisodeResult.model_validate(row)
