@@ -182,7 +182,43 @@ def test_all_seven_notebooks_valid_and_no_secret_files_tracked() -> None:
     errors = validate_all_notebooks(nb_dir)
     assert errors == [], f"Notebook validation errors: {errors}"
 
-    # Verify .gitignore blocks JEV_API_KEY.txt and OPENAI_KEY.txt
+    # Verify .gitignore blocks JEV_API_KEY.txt, OPENAI_KEY.txt, and AUTODL_KEY.txt
     gitignore = (repo_root / ".gitignore").read_text(encoding="utf-8")
     assert "JEV_API_KEY.txt" in gitignore
     assert "OPENAI_KEY.txt" in gitignore
+    assert "AUTODL_KEY.txt" in gitignore
+
+    # Verify incremental Notebook 07 also passes strict AST & secret validation
+    from scripts.validate_notebooks import validate_notebook_file
+
+    nb07_errors = validate_notebook_file(nb_dir / "07_cross_model_generalization.ipynb")
+    assert nb07_errors == [], f"Notebook 07 validation errors: {nb07_errors}"
+
+
+def test_cross_model_tables_and_figures(tmp_path: Path) -> None:
+    from dial_skill.eval.report import (
+        generate_tab_cross_model_pagemantle,
+        generate_tab_cross_model_when2speak,
+        plot_cross_family_judge_agreement,
+        plot_cross_model_pagemantle_gain,
+        plot_cross_model_w2s_gain,
+    )
+
+    w2s_rows = [
+        {"family": "OpenAI-4.1", "model": "gpt-4.1-mini", "direct_macro_f1": 0.40, "dial_macro_f1": 0.62, "direct_fir": 0.60, "dial_fir": 0.05, "dial_auroc": 0.69, "mcnemar_p": 0.0},
+        {"family": "DeepSeek", "model": "DeepSeek-V4.1-Flash", "direct_macro_f1": 0.45, "dial_macro_f1": 0.65, "direct_fir": 0.48, "dial_fir": 0.07, "dial_auroc": 0.74, "mcnemar_p": 0.0002},
+    ]
+    pm_rows = [
+        {"family": "OpenAI-4.1", "model": "gpt-4.1", "direct_overall": 4.90, "dial_overall": 8.61, "dial_silence_accuracy": 1.0, "dial_action_recall": 0.97, "dial_audience": 8.41, "dial_cost_per_task_usd": 0.0059},
+        {"family": "Qwen", "model": "Qwen3.5-397B-A17B", "direct_overall": 6.10, "dial_overall": 8.40, "dial_silence_accuracy": 0.90, "dial_action_recall": 0.92, "dial_audience": 8.20, "dial_cost_per_task_usd": 0.0040},
+    ]
+    t1 = generate_tab_cross_model_when2speak(w2s_rows, tmp_path / "tab_cross_w2s.tex")
+    t2 = generate_tab_cross_model_pagemantle(pm_rows, tmp_path / "tab_cross_pm.tex")
+    assert "\\begin{tabular}" in t1.read_text(encoding="utf-8")
+    assert "\\begin{tabular}" in t2.read_text(encoding="utf-8")
+
+    f1 = plot_cross_model_w2s_gain(w2s_rows, tmp_path / "fig_cross_w2s.pdf")
+    f2 = plot_cross_model_pagemantle_gain(pm_rows, tmp_path / "fig_cross_pm.pdf")
+    f3 = plot_cross_family_judge_agreement([8.0, 9.0, 5.0, 10.0], [7.8, 8.9, 5.4, 9.8], "gpt-4.1", "Qwen3.5-397B-A17B", 0.96, tmp_path / "fig_judge.pdf")
+    for p in (f1, f2, f3):
+        assert p.read_bytes().startswith(b"%PDF") and len(p.read_bytes()) > 1000

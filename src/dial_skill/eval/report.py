@@ -407,3 +407,180 @@ def save_case_studies(case_studies: dict[str, Any], out_path: str | Path) -> Pat
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(case_studies, indent=2, ensure_ascii=False), encoding="utf-8")
     return p
+
+
+# ---------------------------------------------------------------------------
+# 4. Incremental Cross-Model Generalization Tables & Figures (Notebook 07)
+# ---------------------------------------------------------------------------
+
+
+def generate_tab_cross_model_when2speak(rows: Sequence[dict[str, Any]], out_path: str | Path) -> Path:
+    """Generate tab_cross_model_when2speak.tex comparing Direct Chat vs DIAL-Skill across model families."""
+    lines = [
+        "\\begin{table}[t]",
+        "\\centering",
+        "\\caption{Cross-model generalization on \\textbf{When2Speak} across OpenAI generations and open-weight/Chinese model families (zero weight updates; validation-calibrated on $\\le 200$ turns).}",
+        "\\label{tab:cross_model_when2speak}",
+        "\\resizebox{\\linewidth}{!}{%",
+        "\\begin{tabular}{llccccccc}",
+        "\\toprule",
+        "\\textbf{Family} & \\textbf{Model} & \\textbf{Direct F1} & \\textbf{DIAL F1} $\\uparrow$ & \\textbf{$\\Delta$ F1} & \\textbf{Direct FIR} & \\textbf{DIAL FIR} $\\downarrow$ & \\textbf{DIAL AUROC} & \\textbf{McNemar $p$} \\\\",
+        "\\midrule",
+    ]
+    for r in rows:
+        d_f1 = r.get("direct_macro_f1")
+        o_f1 = r.get("dial_macro_f1")
+        delta = (float(o_f1) - float(d_f1)) if (d_f1 is not None and o_f1 is not None) else None
+        delta_str = f"{delta:+.3f}" if delta is not None else "--"
+        pval = r.get("mcnemar_p")
+        p_str = "$<$0.001" if (isinstance(pval, (int, float)) and pval < 0.001) else _fmt(pval, 3)
+        lines.append(
+            f"{_tex_escape(r.get('family', ''))} & {_tex_escape(r.get('model', ''))} & "
+            f"{_fmt(d_f1, 3)} & \\textbf{{{_fmt(o_f1, 3)}}} & {delta_str} & "
+            f"{_fmt(r.get('direct_fir'), 3)} & {_fmt(r.get('dial_fir'), 3)} & "
+            f"{_fmt(r.get('dial_auroc'), 3)} & {p_str} \\\\"
+        )
+    lines.extend(["\\bottomrule", "\\end{tabular}%", "}", "\\end{table}", ""])
+    p = Path(out_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("\n".join(lines), encoding="utf-8")
+    return p
+
+
+def generate_tab_cross_model_pagemantle(rows: Sequence[dict[str, Any]], out_path: str | Path) -> Path:
+    """Generate tab_cross_model_pagemantle.tex comparing Direct Chat vs DIAL-Skill on PageMantle across families."""
+    lines = [
+        "\\begin{table}[t]",
+        "\\centering",
+        "\\caption{Cross-model generalization on \\textbf{PageMantle} (0--10 Blinded Dual-Judge) across OpenAI and open-weight/Chinese backbones.}",
+        "\\label{tab:cross_model_pagemantle}",
+        "\\resizebox{\\linewidth}{!}{%",
+        "\\begin{tabular}{llccccccc}",
+        "\\toprule",
+        "\\textbf{Family} & \\textbf{Model} & \\textbf{Direct Overall} & \\textbf{DIAL Overall} $\\uparrow$ & \\textbf{$\\Delta$} & \\textbf{Sil Acc} & \\textbf{Act Rec} & \\textbf{Audience} & \\textbf{\\$/Task} \\\\",
+        "\\midrule",
+    ]
+    for r in rows:
+        d_ov = r.get("direct_overall")
+        o_ov = r.get("dial_overall")
+        delta = (float(o_ov) - float(d_ov)) if (d_ov is not None and o_ov is not None) else None
+        delta_str = f"{delta:+.2f}" if delta is not None else "--"
+        sil_val = r.get("dial_silence_accuracy")
+        act_val = r.get("dial_action_recall")
+        sil_str = f"{100.0 * float(sil_val):.1f}\\%" if sil_val is not None else "--"
+        act_str = f"{100.0 * float(act_val):.1f}\\%" if act_val is not None else "--"
+        lines.append(
+            f"{_tex_escape(r.get('family', ''))} & {_tex_escape(r.get('model', ''))} & "
+            f"{_fmt(d_ov, 2)} & \\textbf{{{_fmt(o_ov, 2)}}} & {delta_str} & "
+            f"{sil_str} & {act_str} & {_fmt(r.get('dial_audience'), 2)} & "
+            f"{_fmt(r.get('dial_cost_per_task_usd'), 4)} \\\\"
+        )
+    lines.extend(["\\bottomrule", "\\end{tabular}%", "}", "\\end{table}", ""])
+    p = Path(out_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("\n".join(lines), encoding="utf-8")
+    return p
+
+
+def plot_cross_model_w2s_gain(rows: Sequence[dict[str, Any]], out_path: str | Path) -> Path:
+    """Generate fig_cross_model_w2s_gain.pdf (Direct vs DIAL-Skill Macro F1 and FIR across model families)."""
+    p = Path(out_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+
+    labels = [str(r["model"]) for r in rows]
+    direct_f1 = [float(r["direct_macro_f1"]) if r.get("direct_macro_f1") is not None else np.nan for r in rows]
+    dial_f1 = [float(r["dial_macro_f1"]) if r.get("dial_macro_f1") is not None else np.nan for r in rows]
+    direct_fir = [float(r["direct_fir"]) if r.get("direct_fir") is not None else np.nan for r in rows]
+    dial_fir = [float(r["dial_fir"]) if r.get("dial_fir") is not None else np.nan for r in rows]
+
+    x = np.arange(len(labels))
+    w = 0.36
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(max(9.5, 1.15 * len(labels)), 4.1))
+
+    ax1.bar(x - w / 2, direct_f1, width=w, color="#9aa5b1", label="Direct Chat (B0)")
+    ax1.bar(x + w / 2, dial_f1, width=w, color="#1f77b4", label="DIAL-Skill (Ours)")
+    ax1.axhline(0.567, color="#d62728", linestyle="--", linewidth=1.2, label="GPT-4o Zero-Shot Ref (0.567)")
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(labels, rotation=28, ha="right", fontsize=8.5)
+    ax1.set_ylabel("Macro F1 $\\uparrow$")
+    ax1.set_title("When2Speak Macro F1 Across Model Families")
+    ax1.set_ylim(0.0, 0.90)
+    ax1.grid(True, axis="y", linestyle="--", alpha=0.35)
+    ax1.legend(loc="upper left", frameon=True, fontsize=8)
+
+    ax2.bar(x - w / 2, direct_fir, width=w, color="#e07a5f", label="Direct Chat FIR")
+    ax2.bar(x + w / 2, dial_fir, width=w, color="#2a9d8f", label="DIAL-Skill FIR (Ours)")
+    ax2.set_xticks(x)
+    ax2.set_xticklabels(labels, rotation=28, ha="right", fontsize=8.5)
+    ax2.set_ylabel("False Interruption Rate (FIR) $\\downarrow$")
+    ax2.set_title("Interruption Restraint Across Model Families")
+    ax2.set_ylim(0.0, 1.0)
+    ax2.grid(True, axis="y", linestyle="--", alpha=0.35)
+    ax2.legend(loc="upper right", frameon=True, fontsize=8)
+
+    fig.tight_layout()
+    fig.savefig(p, format="pdf")
+    plt.close(fig)
+    return p
+
+
+def plot_cross_model_pagemantle_gain(rows: Sequence[dict[str, Any]], out_path: str | Path) -> Path:
+    """Generate fig_cross_model_pagemantle_gain.pdf (Direct vs DIAL-Skill PageMantle score across families)."""
+    p = Path(out_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+
+    labels = [str(r["model"]) for r in rows]
+    direct_ov = [float(r.get("direct_overall", 0.0) or 0.0) for r in rows]
+    dial_ov = [float(r.get("dial_overall", 0.0) or 0.0) for r in rows]
+
+    x = np.arange(len(labels))
+    w = 0.36
+    fig, ax = plt.subplots(figsize=(max(6.4, 0.95 * len(labels)), 4.2))
+    ax.bar(x - w / 2, direct_ov, width=w, color="#9aa5b1", label="Direct Proactive Agent (B0)")
+    ax.bar(x + w / 2, dial_ov, width=w, color="#2b6cb0", label="DIAL-Skill (Ours)")
+    for i, (d, o) in enumerate(zip(direct_ov, dial_ov)):
+        if o > 0:
+            ax.annotate(f"{o:.2f}", (x[i] + w / 2, o), textcoords="offset points", xytext=(0, 3), ha="center", fontsize=8, fontweight="bold")
+    ax.axhline(6.38, color="#e67e22", linestyle=":", linewidth=1.2, label="Deepnote Ref: GPT-6 Luna (6.38)")
+    ax.axhline(8.65, color="#27ae60", linestyle="--", linewidth=1.2, label="Deepnote Ref: GPT-6.1 Sol (8.65)")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=25, ha="right", fontsize=8.5)
+    ax.set_ylabel("PageMantle Overall Score (0--10) $\\uparrow$")
+    ax.set_title("Cross-Model Generalization on Enterprise PageMantle")
+    ax.set_ylim(0.0, 10.5)
+    ax.grid(True, axis="y", linestyle="--", alpha=0.35)
+    ax.legend(loc="lower right", frameon=True, fontsize=8)
+    fig.tight_layout()
+    fig.savefig(p, format="pdf")
+    plt.close(fig)
+    return p
+
+
+def plot_cross_family_judge_agreement(
+    primary_scores: Sequence[float],
+    secondary_scores: Sequence[float],
+    primary_label: str,
+    secondary_label: str,
+    spearman_rho: float,
+    out_path: str | Path,
+) -> Path:
+    """Generate fig_cross_family_judge_agreement.pdf verifying absence of single-vendor judge bias."""
+    p = Path(out_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+
+    fig, ax = plt.subplots(figsize=(5.0, 4.4))
+    xs = np.asarray(primary_scores, dtype=float)
+    ys = np.asarray(secondary_scores, dtype=float)
+    ax.scatter(xs, ys, s=55, alpha=0.80, color="#1f77b4", edgecolors="white", linewidth=0.6)
+    ax.plot([0, 10], [0, 10], "--", color="#666666", linewidth=1.1, label="Identity ($y = x$)")
+    ax.set_xlim(-0.3, 10.3)
+    ax.set_ylim(-0.3, 10.3)
+    ax.set_xlabel(f"Primary Judge: {primary_label} (0--10)")
+    ax.set_ylabel(f"Cross-Family Judge: {secondary_label} (0--10)")
+    ax.set_title(f"Cross-Family Blinded Judge Agreement ($\\rho = {spearman_rho:.3f}$)")
+    ax.grid(True, linestyle="--", alpha=0.35)
+    ax.legend(loc="lower right", frameon=True)
+    fig.tight_layout()
+    fig.savefig(p, format="pdf")
+    plt.close(fig)
+    return p

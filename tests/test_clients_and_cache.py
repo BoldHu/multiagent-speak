@@ -103,6 +103,16 @@ def test_secret_lookup_priority_and_masking(tmp_path: Path, monkeypatch: pytest.
     assert mask_secret("sk-env-override99") == "sk-e...de99"
     assert mask_secret(None) == "<missing>"
 
+    # AutoDL multi-line key file parsing (URLs + model names + key line)
+    from dial_skill.utils.secrets import load_autodl_api_key
+
+    monkeypatch.delenv("AUTODL_API_KEY", raising=False)
+    (drive_root / "secrets" / "AUTODL_KEY.txt").write_text(
+        "https://www.autodl.art/api/v1\nDeepSeek-V4.1-Flash\nGLM-5.3-flash\nKEY=sk-autodl-testkey998877\n",
+        encoding="utf-8",
+    )
+    assert load_autodl_api_key(drive_root=drive_root, workspace_root=ws_root) == "sk-autodl-testkey998877"
+
 
 def test_sqlite_cache_five_tuple_key_and_persistence(tmp_path: Path) -> None:
     db_path = tmp_path / "api_cache.sqlite"
@@ -167,6 +177,25 @@ def test_openai_client_structured_json_and_cache_reuse(tmp_path: Path) -> None:
     assert fake_oai.chat.completions.calls == 1
     assert client.usage.api_calls == 1
     assert client.usage.cache_hits == 1
+
+    # Verify <think> tag stripping & separate provider_name cache isolation for AutoDL / non-OpenAI gateways
+    fake_think = _FakeAsyncOpenAI(['<think>Let me verify carefully...</think>\n```json\n{"ok": true}\n```'])
+    adl_client = OpenAIClient(
+        api_key="adl-key",
+        cache=cache,
+        async_client=fake_think,
+        base_url="https://www.autodl.art/api/v1",
+        provider_name="autodl",
+    )
+    r_adl = asyncio.run(
+        adl_client.complete_json(
+            model="DeepSeek-V4.1-Flash",
+            messages=[{"role": "user", "content": "ping"}],
+            json_schema={"type": "object", "required": ["ok"], "properties": {"ok": {"type": "boolean"}}},
+        )
+    )
+    assert r_adl.parsed_json == {"ok": True}
+    assert adl_client.provider_name == "autodl"
     cache.close()
 
 

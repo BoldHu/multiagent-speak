@@ -10,7 +10,14 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from openai import APIConnectionError, APITimeoutError, AsyncOpenAI, InternalServerError, RateLimitError
+from openai import (
+    APIConnectionError,
+    APITimeoutError,
+    AsyncOpenAI,
+    BadRequestError,
+    InternalServerError,
+    RateLimitError,
+)
 from pydantic import BaseModel
 from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt, wait_exponential
 
@@ -58,8 +65,9 @@ class UsageTracker:
 
 
 def _extract_json_object(text: str) -> dict[str, Any]:
-    """Parse strict JSON text, stripping optional markdown code fences if present."""
-    stripped = text.strip()
+    """Parse strict JSON text, stripping optional <think> blocks and markdown code fences."""
+    cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    stripped = cleaned.strip()
     if stripped.startswith("```"):
         stripped = re.sub(r"^```(?:json)?\s*", "", stripped)
         stripped = re.sub(r"\s*```$", "", stripped)
@@ -77,8 +85,15 @@ def _extract_json_object(text: str) -> dict[str, Any]:
     raise ValueError(f"Could not parse JSON object from model response: {text[:200]!r}")
 
 
+def _uses_max_completion_tokens(model: str, provider_name: str) -> bool:
+    if provider_name != "openai":
+        return False
+    m = model.lower()
+    return m.startswith(("gpt-5", "gpt-6", "o1", "o3", "o4"))
+
+
 class OpenAIClient:
-    """Async OpenAI wrapper enforcing caching, retries, concurrency limits, and USD tracking."""
+    """Async OpenAI (and OpenAI-compatible gateway) wrapper enforcing caching, retries, concurrency, and USD tracking."""
 
     def __init__(
         self,
@@ -87,12 +102,16 @@ class OpenAIClient:
         cache: SQLiteAPICache | None = None,
         async_client: Any | None = None,
         max_retries: int = 3,
+        base_url: str | None = None,
+        provider_name: str = "openai",
     ) -> None:
         self.models_cfg = models_cfg or load_models_config()
         self.cache = cache if cache is not None else SQLiteAPICache()
         self._api_key = api_key if api_key is not None else load_openai_api_key(required=False)
         self._client = async_client
         self._max_retries = max_retries
+        self._base_url = base_url
+        self.provider_name = provider_name
         self._semaphore = asyncio.Semaphore(max(1, self.models_cfg.openai.max_concurrency))
         self.usage = UsageTracker()
 
@@ -100,12 +119,16 @@ class OpenAIClient:
         if self._client is None:
             if not self._api_key:
                 raise RuntimeError(
-                    "OpenAI API key not found. Set OPENAI_API_KEY or provide OPENAI_KEY.txt."
+                    f"API key not found for provider '{self.provider_name}'. "
+                    "Set the corresponding env var or place the key file in Drive secrets/."
                 )
-            self._client = AsyncOpenAI(
-                api_key=self._api_key,
-                timeout=float(self.models_cfg.openai.timeout_sec),
-            )
+            init_kwargs: dict[str, Any] = {
+                "api_key": self._api_key,
+                "timeout": float(self.models_cfg.openai.timeout_sec),
+            }
+            if self._base_url:
+                init_kwargs["base_url"] = self._base_url
+            self._client = AsyncOpenAI(**init_kwargs)
         return self._client
 
     def estimate_cost_usd(self, model: str, prompt_tokens: int, completion_tokens: int) -> float:
@@ -145,7 +168,7 @@ class OpenAIClient:
 
         if use_cache:
             cached = self.cache.get(
-                provider="openai",
+                provider=self.provider_name,
                 model=model,
                 prompt_hash=prompt_hash,
                 temperature=temperature,
@@ -174,15 +197,52 @@ class OpenAIClient:
         if seed is not None:
             kwargs["seed"] = seed
         if max_tokens is not None:
-            kwargs["max_tokens"] = max_tokens
+            if _uses_max_completion_tokens(model, self.provider_name):
+                kwargs["max_completion_tokens"] = max_tokens
+            else:
+                kwargs["max_tokens"] = max_tokens
         if response_format is not None:
-            kwargs["response_format"] = response_format
+            # Many non-OpenAI OpenAI-compatible gateways do not support strict json_schema; start cleanly
+            if self.provider_name != "openai" and response_format.get("type") == "json_schema":
+                kwargs["response_format"] = {"type": "json_object"}
+            else:
+                kwargs["response_format"] = response_format
         if tools is not None:
             kwargs["tools"] = tools
         if tool_choice is not None:
             kwargs["tool_choice"] = tool_choice
 
         client = self._get_client()
+
+        async def _create_with_compat(call_kwargs: dict[str, Any]) -> Any:
+            cur = dict(call_kwargs)
+            for _ in range(4):
+                try:
+                    return await client.chat.completions.create(**cur)
+                except BadRequestError as exc:
+                    err_l = str(exc).lower()
+                    changed = False
+                    if "max_tokens" in err_l and "max_tokens" in cur:
+                        cur["max_completion_tokens"] = cur.pop("max_tokens")
+                        changed = True
+                    if "temperature" in err_l and "temperature" in cur:
+                        cur.pop("temperature", None)
+                        changed = True
+                    if "seed" in err_l and "seed" in cur:
+                        cur.pop("seed", None)
+                        changed = True
+                    if (
+                        "response_format" in err_l or "json_schema" in err_l or "json_object" in err_l
+                    ) and "response_format" in cur:
+                        rf_type = (cur["response_format"] or {}).get("type")
+                        if rf_type == "json_schema":
+                            cur["response_format"] = {"type": "json_object"}
+                        else:
+                            cur.pop("response_format", None)
+                        changed = True
+                    if not changed:
+                        raise
+            return await client.chat.completions.create(**cur)
 
         async def _invoke() -> Any:
             async for attempt in AsyncRetrying(
@@ -192,7 +252,7 @@ class OpenAIClient:
                 retry=retry_if_exception_type(_TRANSIENT_ERRORS),
             ):
                 with attempt:
-                    return await client.chat.completions.create(**kwargs)
+                    return await _create_with_compat(kwargs)
 
         t0 = time.perf_counter()
         async with self._semaphore:
@@ -229,7 +289,7 @@ class OpenAIClient:
 
         if use_cache:
             self.cache.set(
-                provider="openai",
+                provider=self.provider_name,
                 model=model,
                 prompt_hash=prompt_hash,
                 temperature=temperature,

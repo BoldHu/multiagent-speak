@@ -15,12 +15,20 @@ openai:
   pricing_per_1m_tokens:
     gpt-6-luna: {input: 0.25, output: 1.00}
     gpt-5.6-luna: {input: 0.25, output: 1.00}
+    gpt-5.4-mini: {input: 0.40, output: 1.60}
     gpt-4.1-mini: {input: 0.40, output: 1.60}
+    gpt-4o-mini: {input: 0.15, output: 0.60}
     gpt-6.1-terra: {input: 2.00, output: 8.00}
     gpt-5.6-terra: {input: 2.00, output: 8.00}
+    gpt-5.4: {input: 2.50, output: 10.00}
     gpt-4.1: {input: 2.00, output: 8.00}
+    gpt-4o: {input: 2.50, output: 10.00}
     gpt-6.1-sol: {input: 5.00, output: 20.00}
+    gpt-5.6-sol: {input: 5.00, output: 20.00}
     gpt-6-astra: {input: 5.00, output: 20.00}
+    DeepSeek-V4.1-Flash: {input: 0.20, output: 0.60}
+    GLM-5.3-flash: {input: 0.15, output: 0.50}
+    Qwen3.5-397B-A17B: {input: 0.40, output: 1.20}
     default: {input: 1.00, output: 4.00}
 
 roles:

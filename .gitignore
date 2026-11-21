@@ -3,6 +3,7 @@
 # ==============================================================================
 JEV_API_KEY.txt
 OPENAI_KEY.txt
+AUTODL_KEY.txt
 *_KEY.txt
 *_key.txt
 *.key

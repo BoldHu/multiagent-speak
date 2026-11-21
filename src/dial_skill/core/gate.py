@@ -195,6 +195,38 @@ def compute_gate_decision(
     )
 
 
+def _clamp01(val: Any, default: float = 0.0) -> float:
+    try:
+        return max(0.0, min(1.0, float(val)))
+    except Exception:
+        return default
+
+
+def _normalize_skill(raw: Any) -> SkillName:
+    s = str(raw or "none").strip().lower()
+    if s in ACTIVE_SKILLS:
+        return s  # type: ignore[return-value]
+    return "none"
+
+
+def _normalize_tier(raw: Any, default: InterventionTier = InterventionTier.SILENT) -> InterventionTier:
+    s = str(raw or "").strip().upper()
+    if s in ("SILENT", "NONE", "WAIT"):
+        return InterventionTier.SILENT
+    if s in ("DM_NUDGE", "DM", "PRIVATE", "NUDGE"):
+        return InterventionTier.DM_NUDGE
+    if s in ("THREAD_BRIEF", "THREAD", "REPLY"):
+        return InterventionTier.THREAD_BRIEF
+    if s in ("CHANNEL_INTERVENE", "CHANNEL", "PUBLIC", "BROADCAST"):
+        return InterventionTier.CHANNEL_INTERVENE
+    return default
+
+
+def _normalize_adv_channel(raw: Any) -> str:
+    t = _normalize_tier(raw, default=InterventionTier.THREAD_BRIEF)
+    return InterventionTier.DM_NUDGE.value if t == InterventionTier.SILENT else t.value
+
+
 class DialecticGate:
     """Async Stage-2 evaluator running independent parallel Advocate & Skeptic calls."""
 
@@ -220,13 +252,14 @@ class DialecticGate:
             seed=self.seed,
         )
         data = dict(res.parsed_json or {})
+        raw_cites = data.get("cited_evidence_ids", [])
         out = AdvocateOutput(
             slate_hash=slate.slate_hash,
-            advocate_score=float(data.get("advocate_score", 0.0)),
+            advocate_score=_clamp01(data.get("advocate_score", 0.0)),
             unmitigated_loss=str(data.get("unmitigated_loss", "")),
-            recommended_skill=data.get("recommended_skill", "none"),
-            minimum_effective_channel=data.get("minimum_effective_channel", "THREAD_BRIEF"),
-            cited_evidence_ids=list(data.get("cited_evidence_ids", [])),
+            recommended_skill=_normalize_skill(data.get("recommended_skill", "none")),
+            minimum_effective_channel=_normalize_adv_channel(data.get("minimum_effective_channel", "THREAD_BRIEF")),  # type: ignore[arg-type]
+            cited_evidence_ids=[str(x) for x in raw_cites] if isinstance(raw_cites, list) else [],
         )
         return out, res
 
@@ -240,13 +273,15 @@ class DialecticGate:
             seed=self.seed,
         )
         data = dict(res.parsed_json or {})
+        raw_vetos = data.get("matched_veto_conditions", [])
+        raw_cites = data.get("cited_evidence_ids", [])
         out = SkepticOutput(
             slate_hash=slate.slate_hash,
-            skeptic_score=float(data.get("skeptic_score", 0.0)),
+            skeptic_score=_clamp01(data.get("skeptic_score", 0.0)),
             disruption_risk=str(data.get("disruption_risk", "")),
-            matched_veto_conditions=list(data.get("matched_veto_conditions", [])),
-            max_acceptable_channel=InterventionTier(data.get("max_acceptable_channel", "SILENT")),
-            cited_evidence_ids=list(data.get("cited_evidence_ids", [])),
+            matched_veto_conditions=[str(x) for x in raw_vetos] if isinstance(raw_vetos, list) else [],
+            max_acceptable_channel=_normalize_tier(data.get("max_acceptable_channel", "SILENT")),
+            cited_evidence_ids=[str(x) for x in raw_cites] if isinstance(raw_cites, list) else [],
         )
         return out, res
 
@@ -262,21 +297,24 @@ class DialecticGate:
             seed=self.seed,
         )
         data = dict(res.parsed_json or {})
+        raw_vetos = data.get("matched_veto_conditions", [])
+        raw_cites = data.get("cited_evidence_ids", [])
+        cites = [str(x) for x in raw_cites] if isinstance(raw_cites, list) else []
         adv = AdvocateOutput(
             slate_hash=slate.slate_hash,
-            advocate_score=float(data.get("advocate_score", 0.0)),
+            advocate_score=_clamp01(data.get("advocate_score", 0.0)),
             unmitigated_loss=str(data.get("unmitigated_loss", "")),
-            recommended_skill=data.get("recommended_skill", "none"),
-            minimum_effective_channel=data.get("minimum_effective_channel", "THREAD_BRIEF"),
-            cited_evidence_ids=list(data.get("cited_evidence_ids", [])),
+            recommended_skill=_normalize_skill(data.get("recommended_skill", "none")),
+            minimum_effective_channel=_normalize_adv_channel(data.get("minimum_effective_channel", "THREAD_BRIEF")),  # type: ignore[arg-type]
+            cited_evidence_ids=cites,
         )
         skep = SkepticOutput(
             slate_hash=slate.slate_hash,
-            skeptic_score=float(data.get("skeptic_score", 0.0)),
+            skeptic_score=_clamp01(data.get("skeptic_score", 0.0)),
             disruption_risk=str(data.get("disruption_risk", "")),
-            matched_veto_conditions=list(data.get("matched_veto_conditions", [])),
-            max_acceptable_channel=InterventionTier(data.get("max_acceptable_channel", "SILENT")),
-            cited_evidence_ids=list(data.get("cited_evidence_ids", [])),
+            matched_veto_conditions=[str(x) for x in raw_vetos] if isinstance(raw_vetos, list) else [],
+            max_acceptable_channel=_normalize_tier(data.get("max_acceptable_channel", "SILENT")),
+            cited_evidence_ids=cites,
         )
         return adv, skep, res
 

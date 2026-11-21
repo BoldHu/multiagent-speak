@@ -30,10 +30,34 @@ def _parse_key_file(path: Path) -> str | None:
     if not path.is_file():
         return None
     raw = path.read_text(encoding="utf-8").strip()
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    # Pass 1: explicit key/token assignment (`KEY=...`, `API_KEY: ...`, etc.)
+    for line in lines:
+        for sep in ("=", ":"):
+            if sep in line:
+                lhs, rhs = line.split(sep, 1)
+                lhs_l = lhs.strip().lower()
+                cand = rhs.strip().strip('"').strip("'")
+                if cand and not cand.startswith("http") and any(
+                    tok in lhs_l for tok in ("key", "token", "secret")
+                ):
+                    return cand
+    # Pass 2: bare API-key-like line (`sk-...`, `apik...`, or long opaque token without spaces/URLs)
+    for line in lines:
+        cand = line.strip('"').strip("'")
+        if cand.startswith(("sk-", "apik", "ak-")) and " " not in cand:
+            return cand
+    for line in lines:
+        if "=" in line:
+            _, rhs = line.split("=", 1)
+            candidate = rhs.strip().strip('"').strip("'")
+            if candidate and not candidate.startswith("http"):
+                return candidate
+        cand = line.strip('"').strip("'")
+        if not cand.startswith("http") and " " not in cand and len(cand) >= 24:
+            return cand
+    # Fallback: first non-empty non-comment line
+    for line in lines:
         if "=" in line:
             _, rhs = line.split("=", 1)
             candidate = rhs.strip().strip('"').strip("'")
@@ -144,9 +168,30 @@ def load_openai_api_key(
     return val
 
 
+def load_autodl_api_key(
+    drive_root: str | Path | None = None,
+    workspace_root: str | Path | None = None,
+    required: bool = False,
+) -> str | None:
+    """Load AutoDL OpenAI-compatible API key following the 4-tier lookup order."""
+    val, _ = _resolve_secret(
+        env_names=("AUTODL_API_KEY",),
+        filename="AUTODL_KEY.txt",
+        drive_root=drive_root,
+        workspace_root=workspace_root,
+    )
+    if required and not val:
+        raise RuntimeError(
+            "Missing AutoDL API key. Set AUTODL_API_KEY, place AUTODL_KEY.txt "
+            "in Drive secrets/, Colab userdata, or workspace root."
+        )
+    return val
+
+
 def describe_secret_sources(
     drive_root: str | Path | None = None,
     workspace_root: str | Path | None = None,
+    include_autodl: bool = False,
 ) -> dict[str, dict[str, str]]:
     """Return non-sensitive diagnostic info showing where each key was found."""
     jev_val, jev_src = _resolve_secret(
@@ -155,7 +200,17 @@ def describe_secret_sources(
     oai_val, oai_src = _resolve_secret(
         ("OPENAI_API_KEY",), "OPENAI_KEY.txt", drive_root, workspace_root
     )
-    return {
+    out = {
         "jev": {"status": "found" if jev_val else "missing", "source": jev_src, "masked": mask_secret(jev_val)},
         "openai": {"status": "found" if oai_val else "missing", "source": oai_src, "masked": mask_secret(oai_val)},
     }
+    if include_autodl:
+        adl_val, adl_src = _resolve_secret(
+            ("AUTODL_API_KEY",), "AUTODL_KEY.txt", drive_root, workspace_root
+        )
+        out["autodl"] = {
+            "status": "found" if adl_val else "missing",
+            "source": adl_src,
+            "masked": mask_secret(adl_val),
+        }
+    return out
