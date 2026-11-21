@@ -610,7 +610,7 @@ class DBCSEUpdater:
                 feedback_type=feedback.feedback_type,
                 root_cause=attribution.root_cause,
                 numeric_update=numeric_upd,
-                patch_proposed=proposal,
+                patch_proposed=proposal.model_dump(),
                 promoted=False,
                 rejection_reason=f"guardrail:{reject_reason}",
             )
@@ -707,7 +707,7 @@ class DBCSEUpdater:
             feedback_type=feedback.feedback_type,
             root_cause=attribution.root_cause,
             numeric_update=numeric_upd,
-            patch_proposed=proposal,
+            patch_proposed=proposal.model_dump(),
             escrow_passed=escrow_passed,
             escrow_details=escrow_details,
             promoted=escrow_passed,
