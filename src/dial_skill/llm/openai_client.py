@@ -226,6 +226,9 @@ class OpenAIClient:
                 kwargs["response_format"] = response_format
         if tools is not None:
             kwargs["tools"] = tools
+            # GPT-5.6+ rejects function tools on /v1/chat/completions unless reasoning_effort='none'
+            if self.provider_name == "openai" and model.lower().startswith(("gpt-5.6", "gpt-6")):
+                kwargs["reasoning_effort"] = "none"
         if tool_choice is not None:
             kwargs["tool_choice"] = tool_choice
 
@@ -233,7 +236,7 @@ class OpenAIClient:
 
         async def _create_with_compat(call_kwargs: dict[str, Any]) -> Any:
             cur = dict(call_kwargs)
-            for _ in range(4):
+            for _ in range(5):
                 try:
                     return await client.chat.completions.create(**cur)
                 except BadRequestError as exc:
@@ -242,6 +245,13 @@ class OpenAIClient:
                     if "max_tokens" in err_l and "max_tokens" in cur:
                         cur["max_completion_tokens"] = cur.pop("max_tokens")
                         changed = True
+                    if "reasoning_effort" in err_l:
+                        if cur.get("reasoning_effort") != "none" and "none" in err_l:
+                            cur["reasoning_effort"] = "none"
+                            changed = True
+                        elif "reasoning_effort" in cur:
+                            cur.pop("reasoning_effort", None)
+                            changed = True
                     if "temperature" in err_l and "temperature" in cur:
                         cur.pop("temperature", None)
                         changed = True

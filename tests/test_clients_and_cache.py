@@ -30,9 +30,11 @@ class _FakeCompletions:
     def __init__(self, responses: list[str]) -> None:
         self._responses = list(responses)
         self.calls = 0
+        self.last_kwargs: dict[str, Any] = {}
 
     async def create(self, **kwargs: Any) -> Any:
         self.calls += 1
+        self.last_kwargs = dict(kwargs)
         idx = min(self.calls - 1, len(self._responses) - 1)
         content = self._responses[idx]
         return SimpleNamespace(
@@ -196,6 +198,19 @@ def test_openai_client_structured_json_and_cache_reuse(tmp_path: Path) -> None:
     )
     assert r_adl.parsed_json == {"ok": True}
     assert adl_client.provider_name == "autodl"
+
+    # Verify GPT-5.6 function tool calls automatically set reasoning_effort='none' for /v1/chat/completions
+    fake_tools = _FakeAsyncOpenAI(["Checked DB."])
+    oai_tools = OpenAIClient(api_key="test-key", cache=cache, async_client=fake_tools)
+    asyncio.run(
+        oai_tools.complete_text(
+            model="gpt-5.6-luna",
+            messages=[{"role": "user", "content": "check invoice"}],
+            tools=[{"type": "function", "function": {"name": "ping", "parameters": {"type": "object"}}}],
+            use_cache=False,
+        )
+    )
+    assert fake_tools.chat.completions.last_kwargs.get("reasoning_effort") == "none"
     cache.close()
 
 
