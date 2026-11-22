@@ -292,6 +292,12 @@ def test_blinded_dual_judge_agreement_and_spotcheck_csv(tmp_path: Path) -> None:
     assert compute_cohens_kappa([1, 1, 0, 0, 1], [1, 1, 0, 0, 1]) == 1.0
     assert compute_spearman_rho([1, 2, 3, 4, 5], [2, 4, 6, 8, 10])["rho"] == 1.0
 
+    from dial_skill.eval.judge import _coerce_rubric_score
+
+    assert _coerce_rubric_score({"score": 8.5, "reason": "good"}) == 8.5
+    assert _coerce_rubric_score("9.0/10") == 9.0
+    assert _coerce_rubric_score(12.0) == 10.0
+
     csv_path = export_human_spotcheck_csv(
         episodes=[ep],
         tasks=[task],

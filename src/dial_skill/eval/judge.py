@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import random
+import re
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -34,6 +35,25 @@ DIALOGUE_JUDGE_SCHEMA: dict[str, Any] = {
         "justification": {"type": "string", "maxLength": 240},
     },
 }
+
+
+def _coerce_rubric_score(val: Any) -> float:
+    """Safely extract a 0-10 float from raw judge JSON (handles flat numbers, strings, or {'score': x} dicts)."""
+    if isinstance(val, (int, float)):
+        return max(0.0, min(10.0, float(val)))
+    if isinstance(val, dict):
+        for key in ("score", "rating", "value", "points", "grade"):
+            if key in val and isinstance(val[key], (int, float, str)):
+                return _coerce_rubric_score(val[key])
+        for v in val.values():
+            if isinstance(v, (int, float)):
+                return max(0.0, min(10.0, float(v)))
+        return 0.0
+    if isinstance(val, str):
+        m = re.search(r"-?\d+(?:\.\d+)?", val)
+        if m:
+            return max(0.0, min(10.0, float(m.group(0))))
+    return 0.0
 
 
 def compute_weighted_overall(
@@ -154,8 +174,10 @@ class BlindedDualJudge:
                 seed=self.seed + pass_idx,
             )
             data = res.parsed_json or {}
+            scores_src = data.get("scores") if isinstance(data.get("scores"), dict) else data
             for axis in RUBRIC_WEIGHTS:
-                axis_totals[axis] += max(0.0, min(10.0, float(data.get(axis, 0.0))))
+                raw_val = data.get(axis, scores_src.get(axis, 0.0))
+                axis_totals[axis] += _coerce_rubric_score(raw_val)
             if pass_idx == 0 and isinstance(data.get("justifications"), dict):
                 justifications = {k: str(v) for k, v in data["justifications"].items()}
 

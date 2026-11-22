@@ -224,11 +224,15 @@ class OpenAIClient:
                 kwargs["response_format"] = {"type": "json_object"}
             else:
                 kwargs["response_format"] = response_format
+        has_tool_history = any(
+            isinstance(m, dict) and (m.get("role") == "tool" or m.get("tool_calls"))
+            for m in messages
+        )
         if tools is not None:
             kwargs["tools"] = tools
-            # GPT-5.6+ rejects function tools on /v1/chat/completions unless reasoning_effort='none'
-            if self.provider_name == "openai" and model.lower().startswith(("gpt-5.6", "gpt-6")):
-                kwargs["reasoning_effort"] = "none"
+        if (tools is not None or has_tool_history) and self.provider_name == "openai" and model.lower().startswith(("gpt-5.6", "gpt-6")):
+            # GPT-5.6+ rejects function tools / tool histories on /v1/chat/completions unless reasoning_effort='none'
+            kwargs["reasoning_effort"] = "none"
         if tool_choice is not None:
             kwargs["tool_choice"] = tool_choice
 

@@ -308,13 +308,26 @@ class SkillExecutor:
                 and out.tool_calls_used < remaining_tool_budget
                 and out.model_elapsed_sec < soft_cap
             )
+            has_tool_history = any(m.get("role") == "tool" for m in messages)
+            if not allow_tools and has_tool_history:
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Tool investigation budget is complete. Write your final concise, "
+                            "evidence-grounded response now following the channel format (do not return an empty reply)."
+                        ),
+                    }
+                )
+            call_tools = tools if (allow_tools or (tools is not None and has_tool_history)) else None
+            call_tool_choice = "auto" if allow_tools else ("none" if call_tools is not None else None)
             llm_res = await self.openai_client.complete_text(
                 model=self.executor_model,
                 messages=messages,
                 temperature=self.cfg.executor.temperature,
                 seed=self.seed,
-                tools=tools if allow_tools else None,
-                tool_choice="auto" if allow_tools else None,
+                tools=call_tools,
+                tool_choice=call_tool_choice,
             )
             out.model_elapsed_sec += llm_res.elapsed_sec
             out.cost_usd += llm_res.cost_usd
@@ -373,6 +386,37 @@ class SkillExecutor:
                     out.tool_trace.append({"tool": name, "arguments": args, "output_preview": obs_str[:200]})
 
                 messages.append({"role": "tool", "tool_call_id": tc_id, "content": obs_str})
+
+        # Safeguard: if a model returned empty text after tool calls (e.g., GPT-5.6 stop-without-text),
+        # run one clean plain-text synthesis pass grounded on all collected evidence so we never emit "(empty)".
+        if not final_content.strip() and not out.timed_out and out.model_elapsed_sec < hard_cap:
+            evidence_blocks = []
+            for call_k, obs_v in executed_calls.items():
+                evidence_blocks.append(f"- {call_k} => {obs_v[:600]}")
+            evidence_text = "\n".join(evidence_blocks) if evidence_blocks else "(no additional tool observations)"
+            fallback_msgs = [
+                {"role": "system", "content": sys_prompt},
+                {
+                    "role": "user",
+                    "content": (
+                        f"{user_payload}\n\n"
+                        f"Collected Tool Observations:\n{evidence_text}\n\n"
+                        "Write your final concise, evidence-grounded response now (or exact abort_to_silent JSON if verified false alarm). "
+                        "Do NOT return an empty message."
+                    ),
+                },
+            ]
+            fb_res = await self.openai_client.complete_text(
+                model=self.executor_model,
+                messages=fallback_msgs,
+                temperature=self.cfg.executor.temperature,
+                seed=self.seed,
+                tools=None,
+                tool_choice=None,
+            )
+            out.model_elapsed_sec += fb_res.elapsed_sec
+            out.cost_usd += fb_res.cost_usd
+            final_content = fb_res.content or ""
 
         aborted, reason = _check_abort_to_silent(final_content)
         if aborted:
