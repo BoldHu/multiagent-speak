@@ -10,6 +10,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+import httpx
 from openai import (
     APIConnectionError,
     APITimeoutError,
@@ -27,7 +28,16 @@ from dial_skill.utils.secrets import load_openai_api_key
 
 logger = logging.getLogger(__name__)
 
-_TRANSIENT_ERRORS = (RateLimitError, APITimeoutError, APIConnectionError, InternalServerError, TimeoutError)
+_TRANSIENT_ERRORS = (
+    RateLimitError,
+    APITimeoutError,
+    APIConnectionError,
+    InternalServerError,
+    TimeoutError,
+    httpx.TimeoutException,
+    httpx.TransportError,
+    OSError,
+)
 
 
 class LLMCallResult(BaseModel):
@@ -101,7 +111,8 @@ class OpenAIClient:
         models_cfg: ModelsConfig | None = None,
         cache: SQLiteAPICache | None = None,
         async_client: Any | None = None,
-        max_retries: int = 3,
+        max_retries: int = 5,
+        timeout_sec: float | None = None,
         base_url: str | None = None,
         provider_name: str = "openai",
     ) -> None:
@@ -110,6 +121,7 @@ class OpenAIClient:
         self._api_key = api_key if api_key is not None else load_openai_api_key(required=False)
         self._client = async_client
         self._max_retries = max_retries
+        self._timeout_sec = timeout_sec
         self._base_url = base_url
         self.provider_name = provider_name
         self._semaphore = asyncio.Semaphore(max(1, self.models_cfg.openai.max_concurrency))
@@ -122,9 +134,14 @@ class OpenAIClient:
                     f"API key not found for provider '{self.provider_name}'. "
                     "Set the corresponding env var or place the key file in Drive secrets/."
                 )
+            eff_timeout = (
+                float(self._timeout_sec)
+                if self._timeout_sec is not None
+                else float(self.models_cfg.openai.timeout_sec)
+            )
             init_kwargs: dict[str, Any] = {
                 "api_key": self._api_key,
-                "timeout": float(self.models_cfg.openai.timeout_sec),
+                "timeout": eff_timeout,
             }
             if self._base_url:
                 init_kwargs["base_url"] = self._base_url
@@ -248,7 +265,7 @@ class OpenAIClient:
             async for attempt in AsyncRetrying(
                 reraise=True,
                 stop=stop_after_attempt(self._max_retries),
-                wait=wait_exponential(multiplier=0.5, min=0.5, max=8.0),
+                wait=wait_exponential(multiplier=1.0, min=1.0, max=20.0),
                 retry=retry_if_exception_type(_TRANSIENT_ERRORS),
             ):
                 with attempt:
@@ -257,11 +274,26 @@ class OpenAIClient:
         t0 = time.perf_counter()
         async with self._semaphore:
             response = await _invoke()
+            choice = response.choices[0]
+            msg = choice.message
+            content = msg.content or ""
+            # If gateway returned empty/truncated non-JSON for a JSON request, retry once automatically
+            if response_format is not None:
+                try:
+                    parsed_json = _extract_json_object(content) if content else None
+                except ValueError:
+                    parsed_json = None
+                if parsed_json is None:
+                    logger.warning(
+                        "Malformed/empty JSON from %s/%s; re-sending request once.",
+                        self.provider_name,
+                        model,
+                    )
+                    response = await _invoke()
+                    choice = response.choices[0]
+                    msg = choice.message
+                    content = msg.content or ""
         elapsed = time.perf_counter() - t0
-
-        choice = response.choices[0]
-        msg = choice.message
-        content = msg.content or ""
 
         extracted_tool_calls: list[dict[str, Any]] = []
         raw_tcs = getattr(msg, "tool_calls", None) or []
