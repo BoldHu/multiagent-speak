@@ -239,8 +239,30 @@ def test_summarize_official_8_results() -> None:
 
 
 def test_notebook_08_validates_cleanly() -> None:
-    from scripts.validate_notebooks import validate_notebook_file
+    import ast
+    import importlib
+    import nbformat
+
+    from scripts.validate_notebooks import _strip_ipython_magics, validate_notebook_file
 
     assert NOTEBOOK_08_PATH.is_file(), f"Missing {NOTEBOOK_08_PATH}"
     errors = validate_notebook_file(NOTEBOOK_08_PATH)
     assert not errors, f"Notebook 08 validation failed: {errors}"
+
+    # Verify every `from dial_skill... import ...` symbol in Notebook 08 actually exists!
+    nb = nbformat.read(NOTEBOOK_08_PATH, as_version=4)
+    checked_imports = 0
+    for cell in nb.cells:
+        if cell.cell_type != "code":
+            continue
+        tree = ast.parse(_strip_ipython_magics(cell.source))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module and node.module.startswith("dial_skill"):
+                mod = importlib.import_module(node.module)
+                for alias in node.names:
+                    assert hasattr(mod, alias.name), (
+                        f"Notebook 08 imports missing symbol '{alias.name}' from '{node.module}'"
+                    )
+                    checked_imports += 1
+    assert checked_imports >= 10
+
