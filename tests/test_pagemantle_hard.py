@@ -78,14 +78,17 @@ def test_build_pagemantle_hard_56_tasks_isolation_and_roundtrip(tmp_path: Path) 
     assert reloaded[0].task_id == eval_tasks[0].task_id
 
 
-def test_pagemantle_hard_session_reads_hidden_deltas_and_tracks_deliveries() -> None:
-    built = build_pagemantle_hard_suite(env=None, seed=2026)
+def test_pagemantle_hard_session_reads_hidden_deltas_and_tracks_deliveries(tmp_path: Path) -> None:
+    from dial_skill.benchmarks.pagemantle_env import PageMantleEnv
+
+    real_env = PageMantleEnv(dataset_dir=tmp_path)
+    built = build_pagemantle_hard_suite(env=real_env, seed=2026)
     sil_task = next(t for t in built["pm_hard_eval_32"] if t.trap_type == "cross_service_resolved")
     guard_task = next(t for t in built["pm_hard_eval_32"] if t.mixed_intent_guard)
 
     async def _exercise():
         # 1. Cross-service silence trap: hidden Linear resolution MUST be discoverable via linear_search
-        async with PageMantleHardSession(hard_task=sil_task, base_env=None) as sess:
+        async with PageMantleHardSession(hard_task=sil_task, base_env=real_env) as sess:
             read_schemas = sess.get_openai_tool_schemas(read_only=True)
             names = {s["function"]["name"] for s in read_schemas}
             assert "slack_reply_to_thread" not in names
@@ -106,7 +109,7 @@ def test_pagemantle_hard_session_reads_hidden_deltas_and_tracks_deliveries() -> 
             assert len(sess.delivered_messages) == 0
 
         # 2. Mixed-intent guard task: PostHog aggregate + Notion policy discoverable, Slack write recorded
-        async with PageMantleHardSession(hard_task=guard_task, base_env=None) as sess:
+        async with PageMantleHardSession(hard_task=guard_task, base_env=real_env) as sess:
             ph, _ = await sess.call_tool("posthog_search", {"query": "PH-AGG"}, read_only=True)
             assert ph["ok"] is True and len(ph["matches"]) >= 1
             nt, _ = await sess.call_tool("notion_search", {"query": "Customer Data Handling"}, read_only=True)

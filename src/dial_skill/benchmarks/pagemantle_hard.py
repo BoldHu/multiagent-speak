@@ -271,7 +271,7 @@ class PageMantleHardSession:
 
     async def __aenter__(self) -> PageMantleHardSession:
         if self.base_env is not None:
-            self.base_env.reset_episode()
+            self.base_env.reset_budget()
         return self
 
     async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
