@@ -791,6 +791,62 @@ class OfficialDialSkillAgent:
             seed=seed,
         )
 
+    async def rescore_slate_with_store(
+        self,
+        *,
+        slate: Any,
+        candidate_store: SkillStore,
+        focus_skill: str | None = None,
+    ) -> GateDecision:
+        """Counterfactual Stage-2 rescore on a cached isolated thread slate (for DB-CSE EscrowGate)."""
+        from dial_skill.prompts.templates import render_shared_evidence_slate
+        from dial_skill.schemas import SharedEvidenceSlate
+
+        base_slate = (
+            slate
+            if isinstance(slate, SharedEvidenceSlate)
+            else SharedEvidenceSlate.model_validate(slate)
+        )
+        rebuilt_skills = [
+            candidate_store.require(card.name)
+            for card in base_slate.candidate_skills
+            if candidate_store.get(card.name) is not None
+        ]
+        updated_priors = dict(base_slate.skill_priors)
+        if focus_skill is not None and candidate_store.get(focus_skill) is not None:
+            if not any(c.name == focus_skill for c in rebuilt_skills):
+                rebuilt_skills.append(candidate_store.require(focus_skill))
+            floor = self.cfg.gate.skill_prior_override_floor
+            updated_priors[focus_skill] = max(floor, float(updated_priors.get(focus_skill, 0.0)))
+
+        canonical_text, slate_hash = render_shared_evidence_slate(
+            channel_name=base_slate.channel_name,
+            env_mode=base_slate.env_mode,
+            latest_msg_id=base_slate.latest_msg_id,
+            selected_messages=base_slate.selected_messages,
+            triage_annotations=base_slate.triage_annotations,
+            recon_items=base_slate.recon_items,
+            skill_priors=updated_priors,
+            candidate_skills=rebuilt_skills,
+            total_turns=base_slate.total_turns or len(base_slate.selected_messages),
+            unique_speakers=base_slate.unique_speakers or len({m.speaker for m in base_slate.selected_messages}),
+            prior_agent_turns=base_slate.prior_agent_turns,
+        )
+        updated_slate = base_slate.model_copy(
+            update={
+                "skill_priors": updated_priors,
+                "candidate_skills": rebuilt_skills,
+                "canonical_text": canonical_text,
+                "slate_hash": slate_hash,
+            }
+        )
+        decision, _, _ = await self.gate_stage.evaluate(
+            advocate_slate=updated_slate,
+            skeptic_slate=updated_slate,
+            skill_store=candidate_store,
+        )
+        return decision
+
     async def _run_official_silent_recon(
         self,
         *,
@@ -1200,6 +1256,740 @@ class OfficialDialSkillAgent:
                 "recon_calls": recon.tool_calls_used,
                 "setup_seconds": session.setup_seconds,
             },
+        )
+
+
+# ---------------------------------------------------------------------------
+# Multi-Channel Thread Partitioning & DIAL-Skill v2 (Per-Thread Isolated Gating)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ThreadCandidate:
+    """One isolated Slack thread partitioned from a multi-channel snapshot by (channel_id, root_ts)."""
+
+    thread_id: str
+    channel_id: str
+    channel_name: str
+    root_ts: str
+    raw_messages: list[dict[str, Any]]
+    chat_messages: list[ChatMessage]
+
+
+def partition_snapshot_into_threads(initial_context: dict[str, Any]) -> list[ThreadCandidate]:
+    """Decompose a multi-channel Slack snapshot into disjoint threads keyed by (channel_id, root_ts).
+
+    Prevents already-handled decoy threads in one channel from contaminating Stage-2 Skeptic
+    gating for genuinely unresolved threads in another channel (Thread-Isolated Multi-Channel SSES).
+    """
+    snapshot_time = str(initial_context.get("snapshot_time", ""))
+    groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    order: list[tuple[str, str]] = []
+
+    for idx, msg in enumerate(initial_context.get("messages", []), start=1):
+        ch_id = str(msg.get("channel_id") or "unknown_channel")
+        root_ts = str(msg.get("thread_ts") or msg.get("ts") or f"msg_{idx}")
+        key = (ch_id, root_ts)
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(msg)
+
+    candidates: list[ThreadCandidate] = []
+    for t_idx, key in enumerate(order, start=1):
+        ch_id, root_ts = key
+        raw_msgs = groups[key]
+        ch_name = str(((raw_msgs[0].get("channel") or {}).get("name")) or ch_id)
+        sub_ctx = {"snapshot_time": snapshot_time, "messages": raw_msgs}
+        chat_msgs = format_initial_context_messages(sub_ctx)
+        candidates.append(
+            ThreadCandidate(
+                thread_id=f"T{t_idx:02d}",
+                channel_id=ch_id,
+                channel_name=ch_name,
+                root_ts=root_ts,
+                raw_messages=raw_msgs,
+                chat_messages=chat_msgs,
+            )
+        )
+    return candidates
+
+
+def _select_thread_recon_snippets(
+    thread: ThreadCandidate,
+    all_snippets: list[ReconSnippet],
+    max_snippets: int = 8,
+) -> list[ReconSnippet]:
+    """Prefer recon snippets whose query or output overlaps the thread's entities/channel, with safe fallback."""
+    if not all_snippets:
+        return []
+    blob = " ".join(
+        [
+            thread.channel_name,
+            thread.channel_id,
+            thread.root_ts,
+            *[str(m.get("text", "")) for m in thread.raw_messages],
+            *[str((m.get("author") or {}).get("real_name", "")) for m in thread.raw_messages],
+        ]
+    ).lower()
+    tokens = {
+        tok
+        for tok in blob.replace("/", " ").replace("-", " ").replace("_", " ").split()
+        if len(tok) >= 4 and tok.isalnum()
+    }
+    scored: list[tuple[int, int, ReconSnippet]] = []
+    for idx, snip in enumerate(all_snippets):
+        hay = f"{snip.service} {snip.query} {snip.summary_fact}".lower()
+        overlap = sum(1 for tok in tokens if tok in hay)
+        if thread.root_ts.lower() in hay or thread.channel_id.lower() in hay:
+            overlap += 5
+        scored.append((overlap, -idx, snip))
+    scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    matched = [s for ov, _, s in scored if ov > 0][:max_snippets]
+    if matched:
+        return matched
+    return all_snippets[: min(4, max_snippets)]
+
+
+class OfficialDialSkillV2Agent:
+    """Upgraded Multi-Channel Per-Thread Isolated DIAL-Skill (`DIAL_Skill_v2_thread_isolated`).
+
+    Principled architectural improvements over flat-snapshot v1 (zero task-specific hardcoding):
+    1. **Per-Thread Decomposition**: Partitions the snapshot into disjoint `(channel_id, root_ts)`
+       threads so visibly settled decoy threads never poison Stage-2 Skeptic gating for active threads.
+    2. **Deep Cross-Service Silent Recon**: Runs bounded read-only multi-hop verification across
+       backing services (checking parent threads, latest timestamps, production vs non-production,
+       overrides/exceptions, and whether an owner already decided/closed the issue).
+    3. **Per-Thread Isolated Symmetric-Evidence Gating**: Runs parallel Advocate vs Skeptic
+       independently on each surviving thread's own `SharedEvidenceSlate` + relevant recon snippets.
+    4. **Coordinated Verification-First Stage-3 Execution**: Executes ONLY on Stage-2-approved
+       thread(s), enforces mixed-intent Guard (answer safe aggregate + state policy boundary),
+       deduplicates Stage-1.5 reads, avoids redundant spam, and supports Stage-3 abort-to-silent.
+    """
+
+    def __init__(
+        self,
+        *,
+        triage_client: TriageClient,
+        openai_client: OpenAIClient,
+        gate_model: str,
+        executor_model: str,
+        skill_store: SkillStore | None = None,
+        cfg: DialSkillConfig | None = None,
+        method_name: str = "DIAL_Skill_v2_thread_isolated",
+        recon_max_calls: int = 12,
+        recon_max_turns: int = 6,
+        recon_soft_cap_sec: float = 70.0,
+        stage3_max_turns: int = 22,
+        max_result_chars: int = 12_000,
+        include_primary_slate_in_metadata: bool = False,
+        seed: int = 42,
+    ) -> None:
+        self.cfg = cfg or load_dial_skill_config()
+        self.skill_store = skill_store or SkillStore.from_json_file()
+        self.triage_client = triage_client
+        self.openai_client = openai_client
+        self.gate_model = gate_model
+        self.executor_model = executor_model
+        self.method_name = method_name
+        self.recon_max_calls = recon_max_calls
+        self.recon_max_turns = recon_max_turns
+        self.recon_soft_cap_sec = recon_soft_cap_sec
+        self.stage3_max_turns = stage3_max_turns
+        self.max_result_chars = max_result_chars
+        self.include_primary_slate_in_metadata = include_primary_slate_in_metadata
+        self.seed = seed
+
+        triage_cfg = self.cfg.model_copy(deep=True)
+        triage_cfg.triage.k_slate = max(triage_cfg.triage.k_slate, 12)
+        self.triage_stage = TriageStage(triage_client=triage_client, cfg=triage_cfg)
+        self.gate_stage = DialecticGate(
+            openai_client=openai_client,
+            gate_model=gate_model,
+            cfg=self.cfg,
+            seed=seed,
+        )
+
+    async def rescore_slate_with_store(
+        self,
+        *,
+        slate: Any,
+        candidate_store: SkillStore,
+        focus_skill: str | None = None,
+    ) -> GateDecision:
+        """Counterfactual Stage-2 rescore on a cached isolated thread slate (for DB-CSE EscrowGate)."""
+        from dial_skill.prompts.templates import render_shared_evidence_slate
+        from dial_skill.schemas import SharedEvidenceSlate
+
+        base_slate = (
+            slate
+            if isinstance(slate, SharedEvidenceSlate)
+            else SharedEvidenceSlate.model_validate(slate)
+        )
+        rebuilt_skills = [
+            candidate_store.require(card.name)
+            for card in base_slate.candidate_skills
+            if candidate_store.get(card.name) is not None
+        ]
+        updated_priors = dict(base_slate.skill_priors)
+        if focus_skill is not None and candidate_store.get(focus_skill) is not None:
+            if not any(c.name == focus_skill for c in rebuilt_skills):
+                rebuilt_skills.append(candidate_store.require(focus_skill))
+            floor = self.cfg.gate.skill_prior_override_floor
+            updated_priors[focus_skill] = max(floor, float(updated_priors.get(focus_skill, 0.0)))
+
+        canonical_text, slate_hash = render_shared_evidence_slate(
+            channel_name=base_slate.channel_name,
+            env_mode=base_slate.env_mode,
+            latest_msg_id=base_slate.latest_msg_id,
+            selected_messages=base_slate.selected_messages,
+            triage_annotations=base_slate.triage_annotations,
+            recon_items=base_slate.recon_items,
+            skill_priors=updated_priors,
+            candidate_skills=rebuilt_skills,
+            total_turns=base_slate.total_turns or len(base_slate.selected_messages),
+            unique_speakers=base_slate.unique_speakers or len({m.speaker for m in base_slate.selected_messages}),
+            prior_agent_turns=base_slate.prior_agent_turns,
+        )
+        updated_slate = base_slate.model_copy(
+            update={
+                "skill_priors": updated_priors,
+                "candidate_skills": rebuilt_skills,
+                "canonical_text": canonical_text,
+                "slate_hash": slate_hash,
+            }
+        )
+        decision, _, _ = await self.gate_stage.evaluate(
+            advocate_slate=updated_slate,
+            skeptic_slate=updated_slate,
+            skill_store=candidate_store,
+        )
+        return decision
+
+    @staticmethod
+    def _is_obvious_decoy_thread(triage_out: Any) -> bool:
+        """Conservative Stage-1 decoy filter: skip ONLY pure low-VoI chatter threads."""
+        if triage_out.short_circuited:
+            return True
+        anns = list(triage_out.all_triage_items.values())
+        if not anns:
+            return True
+        max_need = max(float(a.stance_probs.get("need_signal", 0.0)) for a in anns)
+        max_scope = max(float(a.stance_probs.get("scope_risk_signal", 0.0)) for a in anns)
+        max_chg = max(float(a.p_decision_change) for a in anns)
+        latest = anns[-1]
+        if (
+            latest.stance == "background_chatter"
+            and max_chg < 0.25
+            and max_need < 0.20
+            and max_scope < 0.20
+        ):
+            return True
+        return False
+
+    async def _run_deep_silent_recon(
+        self,
+        *,
+        session: Any,
+        surviving_threads: list[tuple[ThreadCandidate, Any]],
+    ) -> tuple[ReconResult, int, int]:
+        """Stage 1.5 bounded read-only multi-hop cross-service recon over surviving candidate threads."""
+        recon = ReconResult()
+        prompt_tokens = 0
+        completion_tokens = 0
+
+        read_tools = session.get_openai_tool_schemas(read_only=True, include_finish_task=False)
+        if not read_tools or self.recon_max_calls <= 0 or not surviving_threads:
+            return recon, 0, 0
+
+        thread_blocks = []
+        plan_seen: set[str] = set()
+        plan_lines: list[str] = []
+        for thread, t_out in surviving_threads:
+            top_skill = t_out.slate.candidate_skills[0].name if t_out.slate.candidate_skills else "none"
+            for card in t_out.slate.candidate_skills[:1]:
+                if card.name not in plan_seen:
+                    plan_seen.add(card.name)
+                    steps = "; ".join(card.investigation_plan)
+                    plan_lines.append(f"- `{card.name}`: {steps}")
+            msg_lines = "\n".join(f"  [{m.msg_id}] {m.speaker}: {m.text}" for m in thread.chat_messages)
+            thread_blocks.append(
+                f"### Candidate Thread {thread.thread_id} (#{thread.channel_name}, channel_id={thread.channel_id}, "
+                f"root_ts={thread.root_ts}, top_skill={top_skill})\n{msg_lines}"
+            )
+
+        system_prompt = (
+            "You are running Stage-1.5 SILENT RECON (strictly read-only) for a proactive workplace AI on Slack.\n"
+            f"You have up to {self.recon_max_calls} read-only tool calls across up to {self.recon_max_turns} turns.\n"
+            "Your objective BEFORE per-thread intervention gating is thorough cross-service verification:\n"
+            "1. Ignore threads that are clearly just routine acknowledgements or completed copy sign-offs; focus your "
+            "reads on threads containing an active question, factual/process claim, draft handoff, incident closeout, "
+            "scheduling proposal, prioritization request, or data-sharing proposal.\n"
+            "2. Whenever a recent message replies to an older thread (`thread_ts != ts`) or references a link/ticket/doc, "
+            "read the full parent Slack thread (`slack_get_thread`) or linked record first.\n"
+            "3. Verify EVERY key claim against authoritative backing services (Linear issues & comments, Notion policies/playbooks "
+            "& history, Stripe/HubSpot/PostHog/BigQuery/Snowflake/Calendar/Analytics/Search Console):\n"
+            "   - Check whether an apparent concern is ALREADY owned, resolved, or explicitly decided in Linear/Notion/Slack.\n"
+            "   - Check for exceptions, overrides, dated updates, production vs non-production distinctions, and exact metric/unit definitions.\n"
+            "   - For requests mixing a legitimate question with sensitive/identifiable data, inspect BOTH the aggregate data AND the handling policy.\n"
+            "4. Group independent read calls in parallel (up to 6 per turn). Do NOT send Slack messages.\n\n"
+            f"Candidate Skill Investigation Plans:\n{chr(10).join(plan_lines) or '- Cross-check Slack threads and enterprise records.'}\n\n"
+            f"Service Discovery Guide:\n{session.service_guide}"
+        )
+
+        user_prompt = (
+            f"Snapshot Time: {session.initial_context.get('snapshot_time')}\n\n"
+            f"Partitioned Candidate Threads:\n" + "\n\n".join(thread_blocks)
+        )
+
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+
+        for _turn in range(self.recon_max_turns):
+            if recon.tool_calls_used >= self.recon_max_calls or recon.model_elapsed_sec >= self.recon_soft_cap_sec:
+                break
+
+            llm_res = await self.openai_client.complete_text(
+                model=self.executor_model,
+                messages=messages,
+                temperature=0.0,
+                seed=self.seed,
+                tools=read_tools,
+                tool_choice="auto",
+                use_cache=False,
+            )
+            recon.model_elapsed_sec += llm_res.elapsed_sec
+            recon.cost_usd += llm_res.cost_usd
+            prompt_tokens += llm_res.prompt_tokens
+            completion_tokens += llm_res.completion_tokens
+
+            if not llm_res.tool_calls:
+                break
+
+            messages.append(_build_assistant_tool_call_message(llm_res.content or "", llm_res.tool_calls))
+
+            for idx, tc in enumerate(llm_res.tool_calls):
+                tc_id = tc.get("id") or f"recon2_tc_{idx}"
+                name = str(tc["name"])
+                args = _safe_parse_tool_args(tc.get("arguments", "{}"))
+                call_key = _canonical_call_key(name, args)
+
+                if recon.tool_calls_used >= self.recon_max_calls:
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tc_id,
+                            "content": json.dumps({"ok": False, "error": "recon_budget_reached"}),
+                        }
+                    )
+                    continue
+
+                if call_key in recon.executed_calls:
+                    obs_str = recon.executed_calls[call_key]
+                else:
+                    _, obs_str = await session.call_tool(
+                        name,
+                        args,
+                        read_only=True,
+                        max_result_chars=self.max_result_chars,
+                    )
+                    recon.executed_calls[call_key] = obs_str
+                    recon.tool_calls_used += 1
+                    service = name.split("_")[0] if "_" in name else name
+                    recon.snippets.append(
+                        ReconSnippet(
+                            recon_id=f"recon_{recon.tool_calls_used}",
+                            service=service,
+                            query=f"{name}({json.dumps(args, sort_keys=True, ensure_ascii=False)})",
+                            summary_fact=obs_str[:950],
+                        )
+                    )
+
+                messages.append({"role": "tool", "tool_call_id": tc_id, "content": obs_str})
+
+        return recon, prompt_tokens, completion_tokens
+
+    async def run_task(self, session: Any) -> OfficialEpisodeResult:
+        model_budget_sec = float(session.limits.get("agent_model_seconds", 180.0))
+        max_parallel_reads = int(session.limits.get("max_read_calls_per_response", 8))
+
+        threads = partition_snapshot_into_threads(session.initial_context)
+        triage_cost_before = self.triage_client.total_cost_usd
+
+        # Stage 1: Per-Thread System-1 Decision-Change Triage
+        surviving: list[tuple[ThreadCandidate, Any]] = []
+        pruned_thread_ids: list[str] = []
+        triage_backend_used = "jev"
+
+        for thread in threads:
+            t_out = await self.triage_stage.run(
+                conversation_id=f"{session.task.task_id}:{thread.thread_id}",
+                channel_name=f"#{thread.channel_name} (isolated thread {thread.thread_id})",
+                env_mode="pagemantle",
+                messages=thread.chat_messages,
+                skill_store=self.skill_store,
+            )
+            triage_backend_used = t_out.triage_backend_used
+            if self._is_obvious_decoy_thread(t_out):
+                pruned_thread_ids.append(thread.thread_id)
+            else:
+                surviving.append((thread, t_out))
+
+        triage_cost = max(0.0, self.triage_client.total_cost_usd - triage_cost_before)
+
+        if not surviving:
+            gate = GateDecision(
+                short_circuited=True,
+                slate_hash="all_threads_pruned_stage1",
+                selected_skill="none",
+                advocate_score=0.0,
+                skeptic_score=1.0,
+                margin_delta=-1.0,
+                disagreement_u=0.0,
+                raw_tier=InterventionTier.SILENT,
+                final_tier=InterventionTier.SILENT,
+                binary_speak=False,
+                deescalation_reasons=["stage1_all_threads_short_circuited"],
+            )
+            return OfficialEpisodeResult(
+                task_id=session.task.task_id,
+                title=session.task.title,
+                category=session.task.category,
+                expected_intent=session.task.intent,
+                method=self.method_name,
+                model_id=f"{self.gate_model}+{self.executor_model}",
+                predicted_action="SILENT",
+                delivered_messages=[],
+                stop_reason="stage1_short_circuit",
+                tool_calls_used=0,
+                read_calls_used=0,
+                write_calls_used=0,
+                model_elapsed_sec=0.0,
+                timed_out=False,
+                total_cost_usd=round(triage_cost, 8),
+                gate=gate,
+                tool_trace=[],
+                initial_context_summary=_summarize_initial_context(session.initial_context),
+                metadata={
+                    "triage_backend_used": triage_backend_used,
+                    "total_threads": len(threads),
+                    "pruned_threads": pruned_thread_ids,
+                    "recon_calls": 0,
+                    "setup_seconds": session.setup_seconds,
+                },
+            )
+
+        # Stage 1.5: Deep Read-Only Silent Recon across surviving threads
+        recon, recon_pt, recon_ct = await self._run_deep_silent_recon(
+            session=session,
+            surviving_threads=surviving,
+        )
+
+        # Stage 2: PER-THREAD ISOLATED Symmetric-Evidence Dialectic Gating
+        per_thread_gates: list[tuple[ThreadCandidate, Any, GateDecision]] = []
+        gate_total_cost = 0.0
+        gate_total_elapsed = 0.0
+
+        async def _eval_one_thread(thread: ThreadCandidate, t_out: Any):
+            thread_snips = _select_thread_recon_snippets(thread, recon.snippets)
+            iso_slate = (
+                rebuild_slate_with_recon(t_out.slate, thread_snips)
+                if thread_snips
+                else t_out.slate
+            )
+            g_dec, g_cost, g_sec = await self.gate_stage.evaluate(
+                advocate_slate=iso_slate,
+                skeptic_slate=iso_slate,
+                skill_store=self.skill_store,
+            )
+            return thread, iso_slate, g_dec, g_cost, g_sec
+
+        gate_results = await asyncio.gather(*(_eval_one_thread(th, to) for th, to in surviving))
+        for th, iso_slate, g_dec, g_cost, g_sec in gate_results:
+            per_thread_gates.append((th, iso_slate, g_dec))
+            gate_total_cost += g_cost
+            gate_total_elapsed = max(gate_total_elapsed, g_sec)
+
+        model_elapsed = recon.model_elapsed_sec + gate_total_elapsed
+        total_cost = triage_cost + recon.cost_usd + gate_total_cost
+        prompt_tokens = recon_pt
+        completion_tokens = recon_ct
+
+        approved = [(th, sl, gd) for th, sl, gd in per_thread_gates if gd.final_tier != InterventionTier.SILENT]
+        # Representative gate = highest-margin approved thread (or highest-margin evaluated thread if all silent)
+        ranked_all = sorted(per_thread_gates, key=lambda x: x[2].margin_delta, reverse=True)
+        primary_thread, primary_slate, primary_gate = (
+            max(approved, key=lambda x: x[2].margin_delta) if approved else ranked_all[0]
+        )
+
+        thread_gate_summary = [
+            {
+                "thread_id": th.thread_id,
+                "channel_name": th.channel_name,
+                "root_ts": th.root_ts,
+                "skill": gd.selected_skill,
+                "final_tier": gd.final_tier.value,
+                "adv": gd.advocate_score,
+                "skep": gd.skeptic_score,
+                "margin": gd.margin_delta,
+            }
+            for th, _, gd in per_thread_gates
+        ]
+
+        if not approved:
+            meta: dict[str, Any] = {
+                "triage_backend_used": triage_backend_used,
+                "total_threads": len(threads),
+                "pruned_threads": pruned_thread_ids,
+                "thread_gates": thread_gate_summary,
+                "recon_calls": recon.tool_calls_used,
+                "setup_seconds": session.setup_seconds,
+            }
+            if self.include_primary_slate_in_metadata:
+                meta["primary_slate"] = primary_slate.model_dump(mode="json")
+            return OfficialEpisodeResult(
+                task_id=session.task.task_id,
+                title=session.task.title,
+                category=session.task.category,
+                expected_intent=session.task.intent,
+                method=self.method_name,
+                model_id=f"{self.gate_model}+{self.executor_model}",
+                predicted_action="SILENT",
+                delivered_messages=[],
+                stop_reason="stage2_all_threads_silent",
+                tool_calls_used=session.read_calls_used + session.write_calls_used,
+                read_calls_used=session.read_calls_used,
+                write_calls_used=session.write_calls_used,
+                model_elapsed_sec=round(model_elapsed, 4),
+                timed_out=False,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_cost_usd=round(total_cost, 8),
+                gate=primary_gate,
+                tool_trace=list(session.tool_trace),
+                initial_context_summary=_summarize_initial_context(session.initial_context),
+                metadata=meta,
+            )
+
+        # Stage 3: Coordinated Verification-First Execution over ONLY Stage-2-Approved Thread(s)
+        skill_card = self.skill_store.get(primary_gate.selected_skill)
+        skill_contract_prompt = build_execution_system_prompt(skill_card, primary_gate.final_tier)
+
+        stage3_system = (
+            f"{session.rendered_official_instruction}\n\n"
+            "=== DIAL-SKILL THREAD-ISOLATED ROUTING & VERIFICATION CONTRACT ===\n"
+            f"{skill_contract_prompt}\n\n"
+            "GENERAL ENTERPRISE VERIFICATION & DELIVERY DISCIPLINE:\n"
+            "1. FOCUS ONLY ON APPROVED THREAD(S): Ignore any other channels/threads that were filtered out as "
+            "already handled. Do NOT post redundant replies to settled decoy threads.\n"
+            "2. VERIFY BEFORE AFFIRMING: Never blindly agree with a teammate's stated metric, billing rule, incident "
+            "recovery claim, credit amount, or proposed meeting slot. Complete any remaining multi-hop reads across "
+            "Linear, Notion, Stripe, HubSpot, PostHog, BigQuery, Snowflake, Calendar, Analytics, or Search Console "
+            "before sending a Slack message.\n"
+            "3. SEPARATE DISTINCT CASES, TIMEFRAMES & UNITS: Explicitly distinguish completed past patches from open "
+            "defects, non-production tests from production recovery, recurring calendar masters from single-date "
+            "exceptions, and event counts from distinct users or approvals.\n"
+            "4. MIXED-INTENT PRIVACY / GUARD RULE: If a thread asks a legitimate business/analytics question AND also "
+            "proposes sharing restricted or identifiable user data, DO NOT refuse the whole request and DO NOT disclose "
+            "restricted PII. Answer the safe aggregate/compliant portion directly in-thread, clearly explain the policy "
+            "boundary, and route any restricted follow-up to the recorded system owner + Security review.\n"
+            "5. CONCISE NON-REDUNDANT DELIVERY: Send ONE clear, well-structured Slack reply per affected thread/recipient "
+            "using `slack_reply_to_thread` (preferred for answering a thread), `slack_post_message`, or `slack_send_dm`. "
+            "Do NOT spam duplicate messages across DMs and channels.\n"
+            "6. STAGE-3 ABORT-TO-SILENT: If deeper verification reveals that EVERY approved thread is already properly "
+            "owned/handled with no remaining unmet need, send ZERO Slack messages and simply call `finish_task`.\n"
+            "7. Always end by calling `finish_task` with no arguments on its own."
+        )
+
+        approved_blocks = []
+        for th, _, gd in approved:
+            msgs_json = json.dumps(th.raw_messages, ensure_ascii=False)
+            approved_blocks.append(
+                f"--- APPROVED THREAD {th.thread_id}: #{th.channel_name} (channel_id={th.channel_id}, "
+                f"root_ts={th.root_ts}) ---\n"
+                f"Skill={gd.selected_skill} | Tier={gd.final_tier.value} | "
+                f"Adv={gd.advocate_score:.2f} | Skep={gd.skeptic_score:.2f}\n"
+                f"Advocate Loss: {gd.advocate.unmitigated_loss if gd.advocate else 'N/A'}\n"
+                f"Skeptic Caution: {gd.skeptic.disruption_risk if gd.skeptic else 'N/A'}\n"
+                f"Messages JSON: {msgs_json}"
+            )
+
+        recon_summary_lines = [
+            f"[{s.recon_id} | {s.service}] {s.query}\n  -> {s.summary_fact}"
+            for s in recon.snippets
+        ]
+        recon_summary_block = "\n".join(recon_summary_lines) or "(none)"
+
+        stage3_user = (
+            f"Snapshot Time: {session.initial_context.get('snapshot_time')}\n\n"
+            f"Stage-2 Approved Thread(s) to Address (only these passed isolated gating):\n"
+            + "\n\n".join(approved_blocks)
+            + f"\n\nStage-1.5 Silent Recon Findings Already Retrieved (do not repeat identical queries):\n"
+            f"{recon_summary_block}"
+        )
+
+        tools = session.get_openai_tool_schemas(read_only=False, include_finish_task=True)
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": stage3_system},
+            {"role": "user", "content": stage3_user},
+        ]
+
+        executed_cache = dict(recon.executed_calls)
+        timed_out = False
+        stop_reason = "max_turns"
+        reminded_once = False
+
+        for _turn in range(self.stage3_max_turns):
+            if model_elapsed >= model_budget_sec:
+                timed_out = True
+                stop_reason = "model_budget"
+                break
+
+            llm_res = await self.openai_client.complete_text(
+                model=self.executor_model,
+                messages=messages,
+                temperature=0.0,
+                seed=self.seed,
+                tools=tools,
+                tool_choice="auto",
+                use_cache=False,
+            )
+            model_elapsed += llm_res.elapsed_sec
+            total_cost += llm_res.cost_usd
+            prompt_tokens += llm_res.prompt_tokens
+            completion_tokens += llm_res.completion_tokens
+
+            if model_elapsed >= model_budget_sec:
+                timed_out = True
+                stop_reason = "model_budget"
+                break
+
+            if not llm_res.tool_calls:
+                messages.append({"role": "assistant", "content": llm_res.content or ""})
+                if reminded_once:
+                    stop_reason = "no_tool_calls"
+                    break
+                reminded_once = True
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Reminder: Plain assistant text does NOT deliver a Slack message. "
+                            "Call a Slack messaging tool to deliver your verified response, or call "
+                            "`finish_task` with no arguments when done (or when aborting to silence)."
+                        ),
+                    }
+                )
+                continue
+
+            messages.append(_build_assistant_tool_call_message(llm_res.content or "", llm_res.tool_calls))
+
+            finished = False
+            read_in_turn = 0
+            for idx, tc in enumerate(llm_res.tool_calls):
+                tc_id = tc.get("id") or f"s3v2_tc_{idx}"
+                name = str(tc["name"])
+                args = _safe_parse_tool_args(tc.get("arguments", "{}"))
+
+                if name == "finish_task":
+                    finished = True
+                    messages.append({"role": "tool", "tool_call_id": tc_id, "content": json.dumps({"ok": True})})
+                    continue
+
+                if name not in SLACK_WRITE_TOOLS:
+                    read_in_turn += 1
+                    if read_in_turn > max_parallel_reads:
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tc_id,
+                                "content": json.dumps(
+                                    {
+                                        "ok": False,
+                                        "error": "too_many_read_calls",
+                                        "message": f"At most {max_parallel_reads} read calls per turn.",
+                                    }
+                                ),
+                            }
+                        )
+                        continue
+                    call_key = _canonical_call_key(name, args)
+                    if call_key in executed_cache:
+                        messages.append({"role": "tool", "tool_call_id": tc_id, "content": executed_cache[call_key]})
+                        continue
+                    _, obs_str = await session.call_tool(
+                        name,
+                        args,
+                        read_only=False,
+                        max_result_chars=self.max_result_chars,
+                    )
+                    executed_cache[call_key] = obs_str
+                    messages.append({"role": "tool", "tool_call_id": tc_id, "content": obs_str})
+                else:
+                    _, obs_str = await session.call_tool(
+                        name,
+                        args,
+                        read_only=False,
+                        max_result_chars=self.max_result_chars,
+                    )
+                    messages.append({"role": "tool", "tool_call_id": tc_id, "content": obs_str})
+
+            if finished:
+                stop_reason = "finish_task" if session.delivered_messages else "stage3_abort_to_silent"
+                break
+
+        predicted: Literal["INTERVENE", "SILENT"] = (
+            "INTERVENE" if len(session.delivered_messages) > 0 else "SILENT"
+        )
+        final_gate = primary_gate
+        if predicted == "SILENT" and primary_gate.binary_speak:
+            final_gate = primary_gate.model_copy(
+                update={
+                    "final_tier": InterventionTier.SILENT,
+                    "binary_speak": False,
+                    "deescalation_reasons": [
+                        *primary_gate.deescalation_reasons,
+                        f"stage3_zero_writes:{stop_reason}",
+                    ],
+                }
+            )
+
+        out_meta: dict[str, Any] = {
+            "triage_backend_used": triage_backend_used,
+            "total_threads": len(threads),
+            "pruned_threads": pruned_thread_ids,
+            "approved_threads": [th.thread_id for th, _, _ in approved],
+            "thread_gates": thread_gate_summary,
+            "recon_calls": recon.tool_calls_used,
+            "setup_seconds": session.setup_seconds,
+        }
+        if self.include_primary_slate_in_metadata:
+            out_meta["primary_slate"] = primary_slate.model_dump(mode="json")
+
+        return OfficialEpisodeResult(
+            task_id=session.task.task_id,
+            title=session.task.title,
+            category=session.task.category,
+            expected_intent=session.task.intent,
+            method=self.method_name,
+            model_id=f"{self.gate_model}+{self.executor_model}",
+            predicted_action=predicted,
+            delivered_messages=list(session.delivered_messages),
+            stop_reason=stop_reason,
+            tool_calls_used=session.read_calls_used + session.write_calls_used,
+            read_calls_used=session.read_calls_used,
+            write_calls_used=session.write_calls_used,
+            model_elapsed_sec=round(model_elapsed, 4),
+            timed_out=timed_out,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_cost_usd=round(total_cost, 8),
+            gate=final_gate,
+            tool_trace=list(session.tool_trace),
+            initial_context_summary=_summarize_initial_context(session.initial_context),
+            metadata=out_meta,
         )
 
 
@@ -1621,11 +2411,14 @@ __all__ = [
     "FINISH_TASK_OPENAI_TOOL",
     "OfficialDirectAgent",
     "OfficialDialSkillAgent",
+    "OfficialDialSkillV2Agent",
     "OfficialEpisodeResult",
     "SLACK_WRITE_TOOLS",
+    "ThreadCandidate",
     "convert_deepnote_tool_to_openai",
     "enforce_deepnote_score_consistency",
     "format_initial_context_messages",
     "load_deepnote_official_catalog",
+    "partition_snapshot_into_threads",
     "summarize_official_8_results",
 ]
