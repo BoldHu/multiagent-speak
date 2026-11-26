@@ -9,7 +9,12 @@ from typing import Any, Protocol, runtime_checkable
 
 from dial_skill.config import DialSkillConfig
 from dial_skill.llm.openai_client import OpenAIClient
-from dial_skill.prompts.templates import build_execution_system_prompt
+from dial_skill.prompts.templates import (
+    STAGE3_AUDITOR_JSON_SCHEMA,
+    WHEN2SPEAK_EXECUTION_SYSTEM_PROMPT,
+    build_execution_system_prompt,
+    build_stage3_auditor_messages,
+)
 from dial_skill.schemas import (
     GateDecision,
     InterventionTier,
@@ -36,6 +41,7 @@ class ReconResult:
     tool_calls_used: int = 0
     model_elapsed_sec: float = 0.0
     cost_usd: float = 0.0
+    uncached_cost_usd: float = 0.0
     executed_calls: dict[str, str] = field(default_factory=dict)
 
 
@@ -46,10 +52,13 @@ class ExecutionOutput:
     target_user: str | None = None
     aborted_to_silent: bool = False
     abort_reason: str | None = None
+    audit_verdict: str | None = None
+    audit_critique: str | None = None
     tool_calls_used: int = 0
     model_elapsed_sec: float = 0.0
     timed_out: bool = False
     cost_usd: float = 0.0
+    uncached_cost_usd: float = 0.0
     tool_trace: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -163,6 +172,7 @@ class SkillExecutor:
             )
             result.model_elapsed_sec += llm_res.elapsed_sec
             result.cost_usd += llm_res.cost_usd
+            result.uncached_cost_usd += llm_res.uncached_cost_usd
 
             if not llm_res.tool_calls:
                 break
@@ -271,10 +281,13 @@ class SkillExecutor:
         max_total_tools = min(skill_cap, self.cfg.executor.default_max_tool_calls)
         remaining_tool_budget = max(0, max_total_tools - recon_calls)
 
-        sys_prompt = build_execution_system_prompt(skill_card, gate.final_tier)
-        if skill_card is not None and skill_card.investigation_plan and tool_env is not None:
-            plan_lines = "\n".join(f"- {s}" for s in skill_card.investigation_plan)
-            sys_prompt += f"\n\nInvestigation Plan (max {remaining_tool_budget} more tool calls):\n{plan_lines}"
+        if slate.env_mode == "when2speak":
+            sys_prompt = WHEN2SPEAK_EXECUTION_SYSTEM_PROMPT
+        else:
+            sys_prompt = build_execution_system_prompt(skill_card, gate.final_tier)
+            if skill_card is not None and skill_card.investigation_plan and tool_env is not None:
+                plan_lines = "\n".join(f"- {s}" for s in skill_card.investigation_plan)
+                sys_prompt += f"\n\nInvestigation Plan (max {remaining_tool_budget} more tool calls):\n{plan_lines}"
 
         user_payload = (
             f"{slate.canonical_text}\n\n"
@@ -331,6 +344,7 @@ class SkillExecutor:
             )
             out.model_elapsed_sec += llm_res.elapsed_sec
             out.cost_usd += llm_res.cost_usd
+            out.uncached_cost_usd += llm_res.uncached_cost_usd
 
             if out.model_elapsed_sec > hard_cap:
                 out.timed_out = True
@@ -416,6 +430,7 @@ class SkillExecutor:
             )
             out.model_elapsed_sec += fb_res.elapsed_sec
             out.cost_usd += fb_res.cost_usd
+            out.uncached_cost_usd += fb_res.uncached_cost_usd
             final_content = fb_res.content or ""
 
         aborted, reason = _check_abort_to_silent(final_content)
@@ -425,6 +440,61 @@ class SkillExecutor:
             out.response_text = None
             out.target_channel = None
             out.target_user = None
-        else:
-            out.response_text = final_content.strip() or None
+            return out
+
+        draft_text = final_content.strip()
+        if (
+            draft_text
+            and self.cfg.executor.enable_pre_delivery_audit
+            and not self.cfg.ablation.disable_pre_delivery_audit
+            and not out.timed_out
+            and out.model_elapsed_sec < hard_cap
+        ):
+            ev_lines = [f"- {k} => {v[:500]}" for k, v in executed_calls.items()]
+            ev_text = "\n".join(ev_lines)
+            audit_msgs = build_stage3_auditor_messages(
+                canonical_slate_text=slate.canonical_text,
+                candidate_draft=draft_text,
+                final_tier=gate.final_tier,
+                selected_skill=gate.selected_skill,
+                tool_evidence_text=ev_text,
+                env_mode=slate.env_mode,
+            )
+            audit_res = await self.openai_client.complete_json(
+                model=self.executor_model,
+                messages=audit_msgs,
+                json_schema=STAGE3_AUDITOR_JSON_SCHEMA,
+                schema_name="dial_skill_stage3_auditor",
+                temperature=0.0,
+                seed=self.seed,
+            )
+            out.model_elapsed_sec += audit_res.elapsed_sec
+            out.cost_usd += audit_res.cost_usd
+            out.uncached_cost_usd += audit_res.uncached_cost_usd
+            audit_data = dict(audit_res.parsed_json or {})
+            verdict = str(audit_data.get("audit_verdict", "APPROVE")).upper()
+            critique = str(audit_data.get("critique", "")).strip()
+            revised = str(audit_data.get("revised_response", "")).strip()
+            out.audit_verdict = verdict
+            out.audit_critique = critique
+
+            if verdict == "VETO_TO_SILENT":
+                out.aborted_to_silent = True
+                out.abort_reason = f"stage3_auditor_veto:{critique or 'redundant_or_resolved'}"
+                out.response_text = None
+                out.target_channel = None
+                out.target_user = None
+                return out
+            if verdict == "REVISE" and revised:
+                rev_aborted, rev_reason = _check_abort_to_silent(revised)
+                if rev_aborted:
+                    out.aborted_to_silent = True
+                    out.abort_reason = rev_reason
+                    out.response_text = None
+                    out.target_channel = None
+                    out.target_user = None
+                    return out
+                draft_text = revised
+
+        out.response_text = draft_text or None
         return out

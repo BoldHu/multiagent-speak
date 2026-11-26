@@ -10,6 +10,7 @@ from dial_skill.eval.report import (
     generate_tab_ablations,
     generate_tab_online_evolution,
     generate_tab_pagemantle,
+    generate_tab_utterance_quality,
     generate_tab_when2speak,
     plot_ablation_delta,
     plot_cost_vs_score,
@@ -57,7 +58,15 @@ def test_latex_table_generators(tmp_path: Path) -> None:
         tmp_path / "tab_ablations.tex",
     )
 
-    for p in (t1, t2, t3, t4):
+    t5 = generate_tab_utterance_quality(
+        [
+            {"method": "B0 Direct", "model": "gpt-4.1-mini", "overall_score": 6.4, "helpfulness": 6.8, "conciseness": 5.6, "appropriateness": 6.5, "avg_words": 74.2, "perm_p": 0.0004},
+            {"method": "DIAL-Collab (Audited)", "model": "gpt-4.1-mini", "overall_score": 8.3, "helpfulness": 8.4, "conciseness": 8.5, "appropriateness": 8.2, "avg_words": 38.5, "perm_p": None},
+        ],
+        tmp_path / "tab_utterance_quality.tex",
+    )
+
+    for p in (t1, t2, t3, t4, t5):
         txt = p.read_text(encoding="utf-8")
         assert "\\begin{tabular}" in txt
         assert "\\toprule" in txt and "\\bottomrule" in txt
@@ -176,9 +185,14 @@ def test_case_study_extractor() -> None:
 
 
 def test_all_seven_notebooks_valid_and_no_secret_files_tracked() -> None:
+    import ast
+    import importlib
+    import nbformat
+    from scripts.validate_notebooks import _strip_ipython_magics
+
     repo_root = find_repo_root()
     nb_dir = repo_root / "notebooks"
-    assert len(EXPECTED_NOTEBOOKS) == 7
+    assert len(EXPECTED_NOTEBOOKS) == 13
     errors = validate_all_notebooks(nb_dir)
     assert errors == [], f"Notebook validation errors: {errors}"
 
@@ -188,11 +202,27 @@ def test_all_seven_notebooks_valid_and_no_secret_files_tracked() -> None:
     assert "OPENAI_KEY.txt" in gitignore
     assert "AUTODL_KEY.txt" in gitignore
 
-    # Verify incremental Notebook 07 also passes strict AST & secret validation
-    from scripts.validate_notebooks import validate_notebook_file
-
-    nb07_errors = validate_notebook_file(nb_dir / "07_cross_model_generalization.ipynb")
-    assert nb07_errors == [], f"Notebook 07 validation errors: {nb07_errors}"
+    # Verify every `from dial_skill... import ...` symbol across Notebooks 10, 11, 12 exists!
+    for nb_name in (
+        "10_when2speak_collab_and_utterance_quality.ipynb",
+        "11_official_deepnote_8_clean_multiseed.ipynb",
+        "12_pagemantle_hard_v3_ablations_and_dbcse.ipynb",
+    ):
+        nb = nbformat.read(nb_dir / nb_name, as_version=4)
+        checked = 0
+        for cell in nb.cells:
+            if cell.cell_type != "code":
+                continue
+            tree = ast.parse(_strip_ipython_magics(cell.source))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom) and node.module and node.module.startswith("dial_skill"):
+                    mod = importlib.import_module(node.module)
+                    for alias in node.names:
+                        assert hasattr(mod, alias.name), (
+                            f"{nb_name} imports missing symbol {alias.name!r} from {node.module!r}"
+                        )
+                        checked += 1
+        assert checked >= 8, f"Expected >=8 verified imports in {nb_name}, got {checked}"
 
 
 def test_cross_model_tables_and_figures(tmp_path: Path) -> None:

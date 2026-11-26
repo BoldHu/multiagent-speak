@@ -14,7 +14,7 @@ import typer
 from sklearn.metrics import f1_score
 from tqdm.auto import tqdm
 
-from dial_skill.baselines.direct_chat import DirectChatBaseline
+from dial_skill.baselines.direct_chat import DirectChatBaseline, DirectSelfConsistencyBaseline
 from dial_skill.baselines.proact import ProACTBaseline
 from dial_skill.baselines.single_gate import SingleGateBaseline
 from dial_skill.benchmarks.pagemantle_env import PageMantleEnv
@@ -29,9 +29,11 @@ from dial_skill.core.pipeline import DialSkillAgent
 from dial_skill.core.skill_store import SkillStore
 from dial_skill.eval.judge import BlindedDualJudge
 from dial_skill.eval.metrics import (
+    apply_platt_scaling,
     compute_pagemantle_metrics,
     compute_when2speak_metrics,
     evaluate_pilot_go_nogo,
+    fit_platt_parameters,
 )
 from dial_skill.evolution.db_cse import DBCSEUpdater
 from dial_skill.evolution.feedback import extract_feedback_from_pagemantle
@@ -88,12 +90,36 @@ def calibrate_when2speak_thresholds(
     val_episodes: Sequence[EpisodeResult],
     eval_turns: Sequence[When2SpeakTurn] | None = None,
     lambda_grid: Sequence[float] = (0.5, 0.75, 1.0, 1.25, 1.5, 2.0),
-    tau_dm_grid: Sequence[float] = (-0.20, -0.10, -0.05, 0.0, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50, 0.60, 0.70),
+    tau_dm_grid: Sequence[float] = (
+        -0.50,
+        -0.35,
+        -0.25,
+        -0.20,
+        -0.15,
+        -0.10,
+        -0.05,
+        0.0,
+        0.05,
+        0.10,
+        0.15,
+        0.20,
+        0.25,
+        0.30,
+        0.40,
+        0.50,
+        0.60,
+        0.70,
+    ),
     theta_floor: float = 0.30,
     max_fir: float | None = None,
     max_mir: float | None = None,
 ) -> dict[str, float]:
-    """Grid-search (lambda, tau_dm) strictly on When2Speak validation split <= 200 turns (Invariant #8)."""
+    """Grid-search (lambda, tau_dm) strictly on When2Speak validation split <= 200 turns (Invariant #8).
+
+    Fixes the infeasible-constraint boundary pathology: when both `max_fir` and `max_mir` are set
+    but no grid point satisfies both simultaneously, falls back cleanly to `best_unconstrained`
+    (optimal Macro-F1) rather than degenerating to an extreme high-tau FIR-only point.
+    """
     assert_no_calibration_leakage(list(val_turns), list(eval_turns or []), max_calib_turns=200)
     by_id = {ep.sample_id: ep for ep in val_episodes}
     if all(t.sample_id in by_id for t in val_turns):
@@ -108,8 +134,7 @@ def calibrate_when2speak_thresholds(
     n_pos = max(1, sum(y_true))
 
     best_unconstrained = (-1.0, 1.0, 0.05, 0.0, 0.0)
-    best_fir_only = (-1.0, 1.0, 0.05, 0.0, 0.0)
-    best_both = (-1.0, 1.0, 0.05, 0.0, 0.0)
+    best_constrained = (-1.0, 1.0, 0.05, 0.0, 0.0)
 
     for lam in lambda_grid:
         for tau in tau_dm_grid:
@@ -128,16 +153,14 @@ def calibrate_when2speak_thresholds(
             cand = (score, float(lam), float(tau), fir, mir)
             if score > best_unconstrained[0]:
                 best_unconstrained = cand
-            if max_fir is not None and fir <= max_fir:
-                if score > best_fir_only[0]:
-                    best_fir_only = cand
-                if max_mir is not None and mir <= max_mir and score > best_both[0]:
-                    best_both = cand
+            fir_ok = max_fir is None or fir <= max_fir
+            mir_ok = max_mir is None or mir <= max_mir
+            if fir_ok and mir_ok and score > best_constrained[0]:
+                best_constrained = cand
 
-    if max_fir is not None and max_mir is not None and best_both[0] >= 0.0:
-        chosen = best_both
-    elif max_fir is not None and best_fir_only[0] >= 0.0:
-        chosen = best_fir_only
+    has_constraints = (max_fir is not None) or (max_mir is not None)
+    if has_constraints and best_constrained[0] >= 0.0:
+        chosen = best_constrained
     else:
         chosen = best_unconstrained
     return {
@@ -148,6 +171,179 @@ def calibrate_when2speak_thresholds(
         "val_mir": round(chosen[4], 6),
         "n_val_turns": len(val_turns),
     }
+
+
+def calibrate_1d_score_threshold(
+    *,
+    val_turns: Sequence[When2SpeakTurn],
+    val_episodes: Sequence[EpisodeResult],
+    eval_turns: Sequence[When2SpeakTurn] | None = None,
+    threshold_grid: Sequence[float] | None = None,
+) -> dict[str, float]:
+    """Universal leak-free validation threshold calibrator for ANY single-score baseline (B1, ProACT, SC@K, Adv-only, Skep-only).
+
+    Extracts `advocate_score` in [0, 1] from each validation episode (`1 - skeptic_score` for skeptic-only)
+    and selects `threshold` maximizing validation Macro-F1 (Invariant #8).
+    """
+    assert_no_calibration_leakage(list(val_turns), list(eval_turns or []), max_calib_turns=200)
+    by_id = {ep.sample_id: ep for ep in val_episodes}
+    aligned_eps = [by_id[t.sample_id] for t in val_turns]
+    y_true = [int(t.label_speak) for t in val_turns]
+    n_neg = max(1, sum(1 - y for y in y_true))
+    n_pos = max(1, sum(y_true))
+
+    scores = [
+        0.0 if ep.gate.short_circuited else float(ep.gate.advocate_score)
+        for ep in aligned_eps
+    ]
+    grid = list(threshold_grid) if threshold_grid is not None else [round(0.05 * k, 4) for k in range(1, 20)]
+
+    best = (-1.0, -1.0, 0.50, 0.0, 0.0)
+    for th in grid:
+        preds = [1 if s >= th else 0 for s in scores]
+        macro = float(f1_score(y_true, preds, average="macro", zero_division=0))
+        fp = sum(1 for y, p in zip(y_true, preds) if y == 0 and p == 1)
+        fn = sum(1 for y, p in zip(y_true, preds) if y == 1 and p == 0)
+        fir = fp / n_neg
+        mir = fn / n_pos
+        bal_acc = 1.0 - 0.5 * (fir + mir)
+        cand = (macro, bal_acc, float(th), fir, mir)
+        if (cand[0], cand[1]) > (best[0], best[1]):
+            best = cand
+
+    return {
+        "best_threshold": best[2],
+        "val_macro_f1": round(best[0], 6),
+        "val_balanced_acc": round(best[1], 6),
+        "val_fir": round(best[3], 6),
+        "val_mir": round(best[4], 6),
+        "n_val_turns": len(val_turns),
+    }
+
+
+def apply_1d_threshold_to_episodes(
+    episodes: Sequence[EpisodeResult],
+    threshold: float,
+) -> list[EpisodeResult]:
+    """Zero-cost rescoring of single-score episodes at calibrated validation `threshold`."""
+    out: list[EpisodeResult] = []
+    for ep in episodes:
+        score = 0.0 if ep.gate.short_circuited else float(ep.gate.advocate_score)
+        speak = (not ep.gate.short_circuited) and (score >= threshold)
+        tier = InterventionTier.THREAD_BRIEF if speak else InterventionTier.SILENT
+        new_gate = ep.gate.model_copy(
+            update={
+                "margin_delta": round(score - threshold, 6),
+                "final_tier": tier,
+                "binary_speak": speak,
+            }
+        )
+        out.append(ep.model_copy(update={"gate": new_gate}))
+    return out
+
+
+def apply_dual_calibration_to_episodes(
+    episodes: Sequence[EpisodeResult],
+    *,
+    best_lambda: float,
+    best_tau_dm: float,
+    theta_floor: float = 0.30,
+) -> list[EpisodeResult]:
+    """Zero-cost rescoring of dual-agent episodes under validation-calibrated `(best_lambda, best_tau_dm)`."""
+    out: list[EpisodeResult] = []
+    for ep in episodes:
+        if ep.gate.short_circuited or ep.gate.advocate_score < theta_floor:
+            delta = round(ep.gate.advocate_score - best_lambda * ep.gate.skeptic_score, 6)
+            if ep.gate.short_circuited:
+                delta = -1.0
+            speak = False
+        else:
+            delta = round(ep.gate.advocate_score - best_lambda * ep.gate.skeptic_score, 6)
+            speak = delta >= best_tau_dm
+        tier = InterventionTier.THREAD_BRIEF if speak else InterventionTier.SILENT
+        new_gate = ep.gate.model_copy(
+            update={
+                "margin_delta": delta,
+                "final_tier": tier,
+                "binary_speak": speak,
+            }
+        )
+        out.append(ep.model_copy(update={"gate": new_gate}))
+    return out
+
+
+def calibrate_platt_from_validation(
+    *,
+    val_turns: Sequence[When2SpeakTurn],
+    val_episodes: Sequence[EpisodeResult],
+    eval_episodes: Sequence[EpisodeResult],
+    eval_turns: Sequence[When2SpeakTurn] | None = None,
+) -> tuple[list[float], dict[str, float]]:
+    """Fit leak-free Platt scaling on `val_turns` margins and return calibrated probabilities for `eval_episodes`."""
+    assert_no_calibration_leakage(list(val_turns), list(eval_turns or []), max_calib_turns=200)
+    by_id = {ep.sample_id: ep for ep in val_episodes}
+    aligned_val = [by_id[t.sample_id] for t in val_turns]
+    val_y = [int(t.label_speak) for t in val_turns]
+    val_margins = [float(ep.gate.margin_delta) for ep in aligned_val]
+    slope_a, intercept_b = fit_platt_parameters(val_y, val_margins)
+    eval_margins = [float(ep.gate.margin_delta) for ep in eval_episodes]
+    probs = apply_platt_scaling(eval_margins, slope_a, intercept_b).tolist()
+    return [float(p) for p in probs], {"platt_slope": round(slope_a, 6), "platt_intercept": round(intercept_b, 6)}
+
+
+def sweep_full_pareto_frontier(
+    *,
+    turns: Sequence[When2SpeakTurn],
+    episodes: Sequence[EpisodeResult],
+    lambdas: Sequence[float] = (0.5, 0.75, 1.0, 1.25, 1.5),
+    taus: Sequence[float] = (-0.40, -0.25, -0.15, -0.05, 0.0, 0.05, 0.12, 0.20, 0.30, 0.45, 0.60),
+    theta_floor: float = 0.20,
+) -> list[dict[str, Any]]:
+    """Dense zero-cost `(lambda, tau_dm)` sweep returning non-dominated FIR-MIR Pareto frontier points."""
+    by_id = {ep.sample_id: ep for ep in turns if hasattr(ep, "sample_id")}
+    del by_id
+    ep_by_id = {ep.sample_id: ep for ep in episodes}
+    aligned = [(t, ep_by_id[t.sample_id]) for t in turns if t.sample_id in ep_by_id]
+    y_true = [int(t.label_speak) for t, _ in aligned]
+    eps = [ep for _, ep in aligned]
+    n_neg = max(1, sum(1 - y for y in y_true))
+    n_pos = max(1, sum(y_true))
+
+    candidates: list[dict[str, Any]] = []
+    for lam in lambdas:
+        for tau in taus:
+            preds = [
+                0
+                if (ep.gate.short_circuited or ep.gate.advocate_score < theta_floor)
+                else (1 if (ep.gate.advocate_score - lam * ep.gate.skeptic_score) >= tau else 0)
+                for ep in eps
+            ]
+            fp = sum(1 for y, p in zip(y_true, preds) if y == 0 and p == 1)
+            fn = sum(1 for y, p in zip(y_true, preds) if y == 1 and p == 0)
+            fir = fp / n_neg
+            mir = fn / n_pos
+            macro = float(f1_score(y_true, preds, average="macro", zero_division=0))
+            candidates.append(
+                {
+                    "lambda": float(lam),
+                    "tau_dm": float(tau),
+                    "fir": round(fir, 6),
+                    "mir": round(mir, 6),
+                    "macro_f1": round(macro, 6),
+                }
+            )
+
+    # Filter to non-dominated Pareto frontier in (FIR, MIR)
+    frontier: list[dict[str, Any]] = []
+    for pt in sorted(candidates, key=lambda d: (d["fir"], d["mir"])):
+        dominated = any(
+            (other["fir"] <= pt["fir"] and other["mir"] <= pt["mir"])
+            and (other["fir"] < pt["fir"] or other["mir"] < pt["mir"])
+            for other in frontier
+        )
+        if not dominated:
+            frontier.append(pt)
+    return frontier
 
 
 def sweep_lambda_pareto_from_episodes(
@@ -209,7 +405,7 @@ def sweep_lambda_pareto_from_episodes(
 
 async def run_when2speak_eval(
     *,
-    agent: DialSkillAgent | DirectChatBaseline | SingleGateBaseline | ProACTBaseline,
+    agent: DialSkillAgent | DirectChatBaseline | DirectSelfConsistencyBaseline | SingleGateBaseline | ProACTBaseline,
     turns: Sequence[When2SpeakTurn],
     output_jsonl: str | Path,
     resume: bool = True,
@@ -276,7 +472,7 @@ async def run_when2speak_eval(
 
 async def run_pagemantle_eval(
     *,
-    agent: DialSkillAgent | DirectChatBaseline | SingleGateBaseline | ProACTBaseline,
+    agent: DialSkillAgent | DirectChatBaseline | DirectSelfConsistencyBaseline | SingleGateBaseline | ProACTBaseline,
     tasks: Sequence[PageMantleTask],
     env: PageMantleEnv,
     output_jsonl: str | Path,
@@ -299,8 +495,14 @@ async def run_pagemantle_eval(
     try:
         for task in pending:
             env.reset_budget()
-            benchmark_tag: Literal["pagemantle_official", "pagemantle_ext"] = (
-                "pagemantle_official" if task.split == "pm_official_8" else "pagemantle_ext"
+            benchmark_tag: Literal[
+                "pagemantle_official",
+                "pagemantle_ext",
+                "pagemantle_synthetic_sanity",
+            ] = (
+                "pagemantle_synthetic_sanity"
+                if task.split == "pm_synthetic_sanity_8"
+                else ("pagemantle_official" if task.split == "pm_official_8" else "pagemantle_ext")
             )
             kwargs: dict[str, Any] = {
                 "sample_id": task.task_id,

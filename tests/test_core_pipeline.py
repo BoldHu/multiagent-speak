@@ -647,3 +647,174 @@ def test_when2speak_mode_prompt_dispatch_chatter_pruning_and_compression(tmp_pat
     assert all("[Skills]" not in user_msg for _, user_msg in fake_oai.seen_prompts)
     assert all("turns=8 speakers=3" in user_msg for _, user_msg in fake_oai.seen_prompts)
 
+
+def test_closed_loop_deliberative_collab_and_stage3_pre_delivery_audit(tmp_path: Path) -> None:
+    """Verify closed-loop Advocate->Skeptic cross-examination and Stage-3 Pre-Delivery Skeptic-Auditor."""
+    messages = [
+        ChatMessage(msg_id=f"m_{i}", speaker=f"Speaker_{i % 3}", text=f"Discussion turn {i}")
+        for i in range(6)
+    ]
+    messages[5].text = "Does anyone know the exact year the first commercial jazz record came out?"
+    scores = {
+        "m_5": {
+            "p_chg": 0.90,
+            "stance": "need_signal",
+            "stance_probs": {"need_signal": 0.90, "defer_or_resolved_signal": 0.02, "scope_risk_signal": 0.02, "background_chatter": 0.06},
+            "skill": "find",
+            "urgency": 0.7,
+        }
+    }
+
+    class _CollabFakeOpenAI:
+        def __init__(self, adv_score: float, audit_verdict: str, revised: str = "") -> None:
+            self.adv_score = adv_score
+            self.audit_verdict = audit_verdict
+            self.revised = revised
+            self.seen_user_prompts: list[str] = []
+            outer = self
+
+            class _Completions:
+                async def create(self, **kwargs: Any) -> Any:
+                    sys_msg = kwargs["messages"][0]["content"]
+                    user_msg = kwargs["messages"][1]["content"]
+                    outer.seen_user_prompts.append(user_msg)
+                    if "ADVOCATE evaluator" in sys_msg:
+                        payload = {
+                            "advocate_score": outer.adv_score,
+                            "unmitigated_loss": "Unanswered factual date question.",
+                            "recommended_skill": "find",
+                            "minimum_effective_channel": "THREAD_BRIEF",
+                            "cited_evidence_ids": ["m_5"],
+                        }
+                        return SimpleNamespace(
+                            choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(payload), tool_calls=None))],
+                            usage=SimpleNamespace(prompt_tokens=140, completion_tokens=35),
+                        )
+                    if "SKEPTIC cross-examiner" in sys_msg:
+                        payload = {
+                            "skeptic_score": 0.12,
+                            "disruption_risk": "Endorsed: mature multi-party factual question.",
+                            "matched_veto_conditions": [],
+                            "max_acceptable_channel": "THREAD_BRIEF",
+                            "cited_evidence_ids": ["m_5"],
+                        }
+                        return SimpleNamespace(
+                            choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(payload), tool_calls=None))],
+                            usage=SimpleNamespace(prompt_tokens=180, completion_tokens=35),
+                        )
+                    if "PRE-DELIVERY SKEPTIC-AUDITOR" in sys_msg:
+                        payload = {
+                            "audit_verdict": outer.audit_verdict,
+                            "critique": "Tightened robotic phrasing.",
+                            "revised_response": outer.revised,
+                        }
+                        return SimpleNamespace(
+                            choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(payload), tool_calls=None))],
+                            usage=SimpleNamespace(prompt_tokens=160, completion_tokens=30),
+                        )
+                    return SimpleNamespace(
+                        choices=[SimpleNamespace(message=SimpleNamespace(content="**Heads-up:** Hello! It was 1917!", tool_calls=None))],
+                        usage=SimpleNamespace(prompt_tokens=120, completion_tokens=25),
+                    )
+
+            self.chat = SimpleNamespace(completions=_Completions())
+
+    # 1. Low Advocate score (< 0.35) skips Skeptic cross-examination cleanly
+    tc1, http1 = _make_jev_mock_client(scores, tmp_path / "c1_jev.sqlite")
+    fake_low = _CollabFakeOpenAI(adv_score=0.15, audit_verdict="APPROVE")
+    oai1 = OpenAIClient(api_key="k", cache=SQLiteAPICache(tmp_path / "c1_oai.sqlite"), async_client=fake_low)
+    collab_cfg = DialSkillAgent.build_collab_config()
+    agent_low = DialSkillAgent(
+        triage_client=tc1,
+        openai_client=oai1,
+        gate_model="gpt-4.1-mini",
+        executor_model="gpt-4.1",
+        cfg=collab_cfg,
+    )
+    ep_low = asyncio.run(
+        agent_low.run_episode(
+            sample_id="low_1",
+            conversation_id="conv_low",
+            channel_name="#group-chat",
+            messages=messages,
+            benchmark="when2speak",
+            generate_text=True,
+        )
+    )
+    asyncio.run(http1.aclose())
+    assert ep_low.gate.binary_speak is False
+    assert len(fake_low.seen_user_prompts) == 1  # Only Advocate called; Skeptic skipped!
+
+    # 2. High Advocate score -> Skeptic cross-examines Advocate thesis -> Stage-3 Auditor REVISE improves utterance
+    tc2, http2 = _make_jev_mock_client(scores, tmp_path / "c2_jev.sqlite")
+    fake_rev = _CollabFakeOpenAI(
+        adv_score=0.88,
+        audit_verdict="REVISE",
+        revised="The first commercial jazz recording was released by the Original Dixieland Jass Band in 1917.",
+    )
+    shared_cache = SQLiteAPICache(tmp_path / "c2_oai.sqlite")
+    oai2 = OpenAIClient(api_key="k", cache=shared_cache, async_client=fake_rev)
+    agent_rev = DialSkillAgent(
+        triage_client=tc2,
+        openai_client=oai2,
+        gate_model="gpt-4.1-mini",
+        executor_model="gpt-4.1",
+        cfg=collab_cfg,
+    )
+    ep_rev = asyncio.run(
+        agent_rev.run_episode(
+            sample_id="rev_1",
+            conversation_id="conv_rev",
+            channel_name="#group-chat",
+            messages=messages,
+            benchmark="when2speak",
+            generate_text=True,
+        )
+    )
+    # Run a second cached episode to verify uncached_cost_usd remains strictly positive on 100% cache hits!
+    ep_cached = asyncio.run(
+        agent_rev.run_episode(
+            sample_id="rev_2",
+            conversation_id="conv_rev",
+            channel_name="#group-chat",
+            messages=messages,
+            benchmark="when2speak",
+            generate_text=True,
+        )
+    )
+    asyncio.run(http2.aclose())
+    assert any("ADVOCATE INTERVENTION THESIS TO CROSS-EXAMINE" in p for p in fake_rev.seen_user_prompts)
+    assert ep_rev.gate.binary_speak is True
+    assert ep_rev.metadata["audit_verdict"] == "REVISE"
+    assert ep_rev.response_text == "The first commercial jazz recording was released by the Original Dixieland Jass Band in 1917."
+    assert ep_cached.total_cost_usd == 0.0
+    assert abs(ep_cached.uncached_cost_usd - ep_rev.uncached_cost_usd) < 1e-8 and ep_cached.uncached_cost_usd > 0.0
+
+    # 3. Stage-3 Auditor VETO_TO_SILENT cleanly aborts redundant draft to SILENT
+    tc3, http3 = _make_jev_mock_client(scores, tmp_path / "c3_jev.sqlite")
+    fake_veto = _CollabFakeOpenAI(adv_score=0.82, audit_verdict="VETO_TO_SILENT")
+    oai3 = OpenAIClient(api_key="k", cache=SQLiteAPICache(tmp_path / "c3_oai.sqlite"), async_client=fake_veto)
+    agent_veto = DialSkillAgent(
+        triage_client=tc3,
+        openai_client=oai3,
+        gate_model="gpt-4.1-mini",
+        executor_model="gpt-4.1",
+        cfg=collab_cfg,
+    )
+    ep_veto = asyncio.run(
+        agent_veto.run_episode(
+            sample_id="veto_1",
+            conversation_id="conv_veto",
+            channel_name="#group-chat",
+            messages=messages,
+            benchmark="when2speak",
+            generate_text=True,
+        )
+    )
+    asyncio.run(http3.aclose())
+    assert ep_veto.gate.binary_speak is False
+    assert ep_veto.gate.final_tier == InterventionTier.SILENT
+    assert ep_veto.metadata["aborted_to_silent"] is True
+    assert ep_veto.response_text is None
+
+

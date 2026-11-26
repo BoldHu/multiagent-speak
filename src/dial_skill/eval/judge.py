@@ -102,11 +102,13 @@ class BlindedDualJudge:
         openai_client: OpenAIClient,
         primary_judge_model: str,
         secondary_judge_model: str | None = None,
+        secondary_openai_client: OpenAIClient | None = None,
         seed: int = 42,
     ) -> None:
         self.openai_client = openai_client
         self.primary_judge_model = primary_judge_model
         self.secondary_judge_model = secondary_judge_model or primary_judge_model
+        self.secondary_openai_client = secondary_openai_client
         self.seed = seed
 
     def _build_blinded_prompt(
@@ -155,14 +157,17 @@ class BlindedDualJudge:
         task: PageMantleTask,
         episode: EpisodeResult,
     ) -> JudgeRubricScore:
-        """Run two blinded deterministic passes (temperature=0.0) and average all four rubric axes."""
-        models = [self.primary_judge_model, self.secondary_judge_model]
+        """Run two blinded deterministic passes (temperature=0.0) across primary & secondary (optionally cross-family) judges."""
+        client_model_pairs = [
+            (self.openai_client, self.primary_judge_model),
+            (self.secondary_openai_client or self.openai_client, self.secondary_judge_model),
+        ]
         axis_totals = {k: 0.0 for k in RUBRIC_WEIGHTS}
         justifications: dict[str, str] = {}
 
-        for pass_idx, judge_model in enumerate(models):
+        for pass_idx, (judge_client, judge_model) in enumerate(client_model_pairs):
             user_prompt = self._build_blinded_prompt(task, episode, pass_idx)
-            res = await self.openai_client.complete_json(
+            res = await judge_client.complete_json(
                 model=judge_model,
                 messages=[
                     {"role": "system", "content": JUDGE_RUBRIC_SYSTEM_PROMPT},
@@ -181,7 +186,7 @@ class BlindedDualJudge:
             if pass_idx == 0 and isinstance(data.get("justifications"), dict):
                 justifications = {k: str(v) for k, v in data["justifications"].items()}
 
-        avg = {k: round(v / len(models), 4) for k, v in axis_totals.items()}
+        avg = {k: round(v / len(client_model_pairs), 4) for k, v in axis_totals.items()}
         overall = compute_weighted_overall(
             avg["intervention_or_silence"],
             avg["content_and_evidence"],
@@ -206,33 +211,82 @@ class BlindedDualJudge:
         transcript: str,
         candidate_response: str,
         reference_response: str | None = None,
+        method_tag_for_blinding: str = "candidate",
     ) -> dict[str, Any]:
-        """Blinded Dialogue Quality Judge for When2Speak stratified TP turns."""
-        user_prompt = (
-            f"Conversation:\n{transcript}\n\n"
-            f"Reference Response (if available): {reference_response or '(none)'}\n\n"
-            f"Blinded Candidate Response:\n{candidate_response}"
+        """Blinded Dual-Pass (optionally Cross-Family) Dialogue Quality Judge for When2Speak SPEAK turns."""
+        use_dual = (
+            self.secondary_openai_client is not None
+            or self.secondary_judge_model != self.primary_judge_model
         )
-        res = await self.openai_client.complete_json(
-            model=self.primary_judge_model,
-            messages=[
+        pairs = (
+            [
+                (self.openai_client, self.primary_judge_model),
+                (self.secondary_openai_client or self.openai_client, self.secondary_judge_model),
+            ]
+            if use_dual
+            else [(self.openai_client, self.primary_judge_model)]
+        )
+
+        sys_prompt = (
+            "You are a strict, blinded evaluator grading a proactive AI participant (`[AGENT]`) in a "
+            "multi-party group conversation on three 0-10 axes plus holistic overall_score (0-10):\n"
+            "1. helpfulness (0-10): substantive accuracy, relevance, and value added relative to the Reference Response.\n"
+            "2. conciseness (0-10): crisp, natural group-chat brevity (penalize stiff corporate headers, bullet bloat, or rambling).\n"
+            "3. appropriateness (0-10): natural conversational register, non-intrusiveness, and collaborative tone.\n"
+            "Return strict JSON."
+        )
+
+        per_judge: list[dict[str, Any]] = []
+        for idx, (j_client, j_model) in enumerate(pairs):
+            blind_id = _anonymize_candidate_tag(sample_id, method_tag_for_blinding, self.seed + idx)
+            if idx % 2 == 0:
+                user_prompt = (
+                    f"Blinded Submission: {blind_id}\n"
+                    f"Conversation History:\n{transcript}\n\n"
+                    f"Gold Reference Response:\n{reference_response or '(none)'}\n\n"
+                    f"Blinded Candidate Response:\n{candidate_response}"
+                )
+            else:
+                user_prompt = (
+                    f"Blinded Submission: {blind_id}\n"
+                    f"Blinded Candidate Response:\n{candidate_response}\n\n"
+                    f"Gold Reference Response:\n{reference_response or '(none)'}\n\n"
+                    f"Conversation History:\n{transcript}"
+                )
+            res = await j_client.complete_json(
+                model=j_model,
+                messages=[
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                json_schema=DIALOGUE_JUDGE_SCHEMA,
+                schema_name="blinded_dialogue_quality",
+                temperature=0.0,
+                seed=self.seed + idx,
+            )
+            raw = dict(res.parsed_json or {})
+            per_judge.append(
                 {
-                    "role": "system",
-                    "content": (
-                        "You are a blinded evaluator grading a proactive group-chat reply on helpfulness, "
-                        "conciseness, and social appropriateness (each 0-10). Return strict JSON."
-                    ),
-                },
-                {"role": "user", "content": user_prompt},
-            ],
-            json_schema=DIALOGUE_JUDGE_SCHEMA,
-            schema_name="blinded_dialogue_quality",
-            temperature=0.0,
-            seed=self.seed,
-        )
-        data = dict(res.parsed_json or {})
-        data["sample_id"] = sample_id
-        return data
+                    "judge_model": j_model,
+                    "helpfulness": _coerce_rubric_score(raw.get("helpfulness", 0.0)),
+                    "conciseness": _coerce_rubric_score(raw.get("conciseness", 0.0)),
+                    "appropriateness": _coerce_rubric_score(raw.get("appropriateness", 0.0)),
+                    "overall_score": _coerce_rubric_score(raw.get("overall_score", 0.0)),
+                    "justification": str(raw.get("justification", "")),
+                }
+            )
+
+        n_j = len(per_judge)
+        return {
+            "sample_id": sample_id,
+            "judge_model": "+".join(p["judge_model"] for p in per_judge),
+            "helpfulness": round(sum(p["helpfulness"] for p in per_judge) / n_j, 4),
+            "conciseness": round(sum(p["conciseness"] for p in per_judge) / n_j, 4),
+            "appropriateness": round(sum(p["appropriateness"] for p in per_judge) / n_j, 4),
+            "overall_score": round(sum(p["overall_score"] for p in per_judge) / n_j, 4),
+            "justification": per_judge[0]["justification"],
+            "per_judge": per_judge,
+        }
 
 
 def export_human_spotcheck_csv(

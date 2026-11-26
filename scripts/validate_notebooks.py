@@ -17,6 +17,12 @@ EXPECTED_NOTEBOOKS = [
     "04_exp_pagemantle_and_online_dbcse.ipynb",
     "05_exp_ablations_and_scaling.ipynb",
     "06_analysis_and_paper_artifacts.ipynb",
+    "07_cross_model_generalization.ipynb",
+    "08_official_deepnote_8_benchmark.ipynb",
+    "09_pagemantle_hard_benchmark.ipynb",
+    "10_when2speak_collab_and_utterance_quality.ipynb",
+    "11_official_deepnote_8_clean_multiseed.ipynb",
+    "12_pagemantle_hard_v3_ablations_and_dbcse.ipynb",
 ]
 
 _SECRET_LEAK_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b|\bjev_[A-Za-z0-9_-]{20,}\b")

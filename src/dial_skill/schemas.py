@@ -191,7 +191,12 @@ class GateDecision(BaseModel):
 
 class EpisodeResult(BaseModel):
     sample_id: str
-    benchmark: Literal["when2speak", "pagemantle_official", "pagemantle_ext"]
+    benchmark: Literal[
+        "when2speak",
+        "pagemantle_official",
+        "pagemantle_ext",
+        "pagemantle_synthetic_sanity",
+    ]
     method: str
     model_id: str
     gate: GateDecision
@@ -204,6 +209,7 @@ class EpisodeResult(BaseModel):
     prompt_tokens_raw: int = 0
     prompt_tokens_slate: int = 0
     total_cost_usd: float = 0.0
+    uncached_cost_usd: float = 0.0
     triage_backend_used: str = "jev"
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -227,7 +233,12 @@ class When2SpeakTurn(BaseModel):
 
 class PageMantleTask(BaseModel):
     task_id: str
-    split: Literal["pm_official_8", "pm_online_stream_24", "pm_eval_32"]
+    split: Literal[
+        "pm_official_8",
+        "pm_synthetic_sanity_8",
+        "pm_online_stream_24",
+        "pm_eval_32",
+    ]
     wave: int | None = None  # 1, 2, or 3 for pm_online_stream_24
     category: ActiveSkillName
     channel_name: str = "#general"

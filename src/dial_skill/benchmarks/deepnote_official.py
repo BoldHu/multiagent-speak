@@ -140,6 +140,7 @@ class OfficialEpisodeResult(BaseModel):
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_cost_usd: float = 0.0
+    uncached_cost_usd: float = 0.0
     gate: GateDecision | None = None
     tool_trace: list[dict[str, Any]] = Field(default_factory=list)
     initial_context_summary: list[dict[str, Any]] = Field(default_factory=list)
@@ -579,6 +580,82 @@ def _summarize_initial_context(initial_context: dict[str, Any]) -> list[dict[str
     return rows
 
 
+GENERAL_ENTERPRISE_DISCIPLINE_BLOCK = (
+    "GENERAL COLLABORATIVE VERIFICATION & COMMUNICATION GUIDELINES:\n"
+    "1. FOCUS ON UNRESOLVED NEEDS: Address only threads with an active question, unverified claim, "
+    "coordination gap, or policy risk. Do NOT send replies to routine acknowledgments or threads already "
+    "resolved by teammates.\n"
+    "2. VERIFY AGAINST AUTHORITATIVE RECORDS: Cross-check claims, metrics, dates, ownership, and policies "
+    "against primary company tools as of the snapshot timestamp before affirming or correcting them, and "
+    "state observed scope boundaries or exceptions clearly.\n"
+    "3. LEAST-PRIVILEGE MIXED-REQUEST HANDLING: When a thread combines a legitimate aggregate or workflow "
+    "question with an unauthorized request for identifiable individual records, answer the safe aggregate "
+    "portion directly in-thread and state the policy requirement for any restricted follow-up.\n"
+    "4. SINGLE CONCISE DELIVERY PER THREAD: Prefer one clear, consolidated reply per unresolved thread "
+    "(`slack_reply_to_thread` for active threads) rather than duplicate messages across channels and DMs. "
+    "If verification shows every thread is already handled, send zero messages and call `finish_task`."
+)
+
+OFFICIAL_STAGE3_AUDITOR_SYSTEM_PROMPT = """You are the PRE-DELIVERY SKEPTIC-AUDITOR in a closed-loop multi-agent workplace assistant.
+The Executor agent has finished investigating and staged candidate Slack message(s) for delivery.
+Before any message is committed to Slack, audit the staged message(s) against the Initial Slack Snapshot and the Retrieved Read-Tool Evidence:
+1. **VETO_TO_SILENT**: Select ONLY if the retrieved read-tool records prove that every staged thread is ALREADY owned, resolved, or deferred with no remaining unmet need, so delivering any message would be an unwarranted interruption.
+2. **REVISE**: Select if intervention IS warranted, but the staged message(s) have a substantive quality or policy defect:
+   - states a figure, status, date, or conclusion not supported by (or contradicted by) the read-tool trace, or omits a critical scope/timeframe caveat visible in the retrieved records;
+   - on a mixed-intent request, either leaks restricted identifiable user records OR refuses the legitimate aggregate question instead of answering the safe aggregate portion;
+   - sends redundant/duplicate Slack messages to the same thread/audience or targets the wrong channel/thread.
+   Provide a crisp, actionable `critique` telling the Executor exactly what to fix in 1 revision pass.
+3. **APPROVE**: Select when the staged message(s) are accurate, grounded in retrieved evidence, concise, non-redundant, and appropriately scoped.
+Return strict JSON matching the schema."""
+
+OFFICIAL_STAGE3_AUDITOR_JSON_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["audit_verdict", "critique"],
+    "properties": {
+        "audit_verdict": {
+            "type": "string",
+            "enum": ["APPROVE", "REVISE", "VETO_TO_SILENT"],
+        },
+        "critique": {"type": "string", "maxLength": 360},
+    },
+}
+
+
+def _consolidate_staged_writes(staged: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Deduplicate & consolidate multiple staged Slack writes targeting the exact same destination."""
+    if len(staged) <= 1:
+        return list(staged)
+    grouped: dict[tuple[str, str, str, str], list[str]] = {}
+    exemplar: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    order: list[tuple[str, str, str, str]] = []
+    for item in staged:
+        name = str(item["tool"])
+        args = dict(item["arguments"])
+        key = (
+            name,
+            str(args.get("channel_id") or ""),
+            str(args.get("thread_ts") or ""),
+            str(args.get("user_id") or ""),
+        )
+        txt = str(args.get("text") or "").strip()
+        if not txt:
+            continue
+        if key not in grouped:
+            grouped[key] = []
+            exemplar[key] = {"tool": name, "arguments": dict(args)}
+            order.append(key)
+        if txt not in grouped[key]:
+            grouped[key].append(txt)
+    consolidated: list[dict[str, Any]] = []
+    for key in order:
+        entry = exemplar[key]
+        merged_args = dict(entry["arguments"])
+        merged_args["text"] = "\n\n".join(grouped[key])
+        consolidated.append({"tool": entry["tool"], "arguments": merged_args})
+    return consolidated
+
+
 class OfficialDirectAgent:
     """Faithful Deepnote Official Direct Baseline (`B0_official_direct`).
 
@@ -592,6 +669,7 @@ class OfficialDirectAgent:
         openai_client: OpenAIClient,
         model: str,
         method_name: str = "B0_official_direct",
+        extra_system_instructions: str = "",
         max_turns: int = 24,
         max_result_chars: int = 12_000,
         seed: int = 42,
@@ -599,6 +677,7 @@ class OfficialDirectAgent:
         self.openai_client = openai_client
         self.model = model
         self.method_name = method_name
+        self.extra_system_instructions = extra_system_instructions.strip()
         self.max_turns = max_turns
         self.max_result_chars = max_result_chars
         self.seed = seed
@@ -608,13 +687,18 @@ class OfficialDirectAgent:
         max_parallel_reads = int(session.limits.get("max_read_calls_per_response", 8))
         tools = session.get_openai_tool_schemas(read_only=False, include_finish_task=True)
 
+        sys_content = session.rendered_official_instruction
+        if self.extra_system_instructions:
+            sys_content = f"{sys_content}\n\n{self.extra_system_instructions}"
+
         messages: list[dict[str, Any]] = [
-            {"role": "system", "content": session.rendered_official_instruction},
+            {"role": "system", "content": sys_content},
             {"role": "user", "content": json.dumps(session.initial_context, ensure_ascii=False)},
         ]
 
         model_elapsed = 0.0
         total_cost = 0.0
+        uncached_cost = 0.0
         prompt_tokens = 0
         completion_tokens = 0
         timed_out = False
@@ -638,6 +722,7 @@ class OfficialDirectAgent:
             )
             model_elapsed += llm_res.elapsed_sec
             total_cost += llm_res.cost_usd
+            uncached_cost += llm_res.uncached_cost_usd
             prompt_tokens += llm_res.prompt_tokens
             completion_tokens += llm_res.completion_tokens
 
@@ -729,10 +814,41 @@ class OfficialDirectAgent:
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_cost_usd=round(total_cost, 8),
+            uncached_cost_usd=round(max(total_cost, uncached_cost), 8),
             gate=None,
             tool_trace=list(session.tool_trace),
             initial_context_summary=_summarize_initial_context(session.initial_context),
             metadata={"setup_seconds": session.setup_seconds},
+        )
+
+
+class OfficialPromptMatchedDirectAgent(OfficialDirectAgent):
+    """Prompt-Matched Single-Agent Direct Baseline (`B0_prompt_matched_direct`).
+
+    Receives Deepnote's official prompt PLUS the exact same domain-general verification,
+    least-privilege mixed-request handling, and single-message delivery guidelines as
+    `OfficialDialSkillV2Agent`, isolating the causal effect of multi-agent collaboration
+    from prompt engineering.
+    """
+
+    def __init__(
+        self,
+        *,
+        openai_client: OpenAIClient,
+        model: str,
+        method_name: str = "B0_prompt_matched_direct",
+        max_turns: int = 24,
+        max_result_chars: int = 12_000,
+        seed: int = 42,
+    ) -> None:
+        super().__init__(
+            openai_client=openai_client,
+            model=model,
+            method_name=method_name,
+            extra_system_instructions=GENERAL_ENTERPRISE_DISCIPLINE_BLOCK,
+            max_turns=max_turns,
+            max_result_chars=max_result_chars,
+            seed=seed,
         )
 
 
@@ -1033,8 +1149,14 @@ class OfficialDialSkillAgent:
             skill_store=self.skill_store,
         )
 
+        triage_uncached = max(
+            triage_cost,
+            getattr(self.triage_client, "uncached_cost_usd", self.triage_client.total_cost_usd),
+        )
+        gate_uncached = max(gate_cost, getattr(self.gate_stage, "last_uncached_cost_usd", gate_cost))
         model_elapsed = recon.model_elapsed_sec + gate_elapsed
         total_cost = triage_cost + recon.cost_usd + gate_cost
+        uncached_cost = triage_uncached + max(recon.cost_usd, recon.uncached_cost_usd) + gate_uncached
         prompt_tokens = recon_pt
         completion_tokens = recon_ct
 
@@ -1132,6 +1254,7 @@ class OfficialDialSkillAgent:
             )
             model_elapsed += llm_res.elapsed_sec
             total_cost += llm_res.cost_usd
+            uncached_cost += llm_res.uncached_cost_usd
             prompt_tokens += llm_res.prompt_tokens
             completion_tokens += llm_res.completion_tokens
 
@@ -1248,6 +1371,7 @@ class OfficialDialSkillAgent:
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_cost_usd=round(total_cost, 8),
+            uncached_cost_usd=round(max(total_cost, uncached_cost), 8),
             gate=final_gate,
             tool_trace=list(session.tool_trace),
             initial_context_summary=_summarize_initial_context(session.initial_context),
@@ -1382,6 +1506,7 @@ class OfficialDialSkillV2Agent:
         recon_soft_cap_sec: float = 70.0,
         stage3_max_turns: int = 22,
         max_result_chars: int = 12_000,
+        enable_pre_delivery_audit: bool = True,
         include_primary_slate_in_metadata: bool = False,
         seed: int = 42,
     ) -> None:
@@ -1397,6 +1522,9 @@ class OfficialDialSkillV2Agent:
         self.recon_soft_cap_sec = recon_soft_cap_sec
         self.stage3_max_turns = stage3_max_turns
         self.max_result_chars = max_result_chars
+        self.enable_pre_delivery_audit = enable_pre_delivery_audit and (
+            not self.cfg.ablation.disable_pre_delivery_audit
+        )
         self.include_primary_slate_in_metadata = include_primary_slate_in_metadata
         self.seed = seed
 
@@ -1527,11 +1655,11 @@ class OfficialDialSkillV2Agent:
             "scheduling proposal, prioritization request, or data-sharing proposal.\n"
             "2. Whenever a recent message replies to an older thread (`thread_ts != ts`) or references a link/ticket/doc, "
             "read the full parent Slack thread (`slack_get_thread`) or linked record first.\n"
-            "3. Verify EVERY key claim against authoritative backing services (Linear issues & comments, Notion policies/playbooks "
-            "& history, Stripe/HubSpot/PostHog/BigQuery/Snowflake/Calendar/Analytics/Search Console):\n"
-            "   - Check whether an apparent concern is ALREADY owned, resolved, or explicitly decided in Linear/Notion/Slack.\n"
-            "   - Check for exceptions, overrides, dated updates, production vs non-production distinctions, and exact metric/unit definitions.\n"
-            "   - For requests mixing a legitimate question with sensitive/identifiable data, inspect BOTH the aggregate data AND the handling policy.\n"
+            "3. Verify key claims against authoritative backing services (Linear, Notion, Stripe, HubSpot, "
+            "PostHog, BigQuery, Snowflake, Calendar, Analytics, Search Console) as of the snapshot timestamp:\n"
+            "   - Check whether an apparent concern is ALREADY owned, resolved, or explicitly decided across tools.\n"
+            "   - Check record status, timestamps, scope boundaries, and any documented policy or schedule exceptions.\n"
+            "   - When a request combines an aggregate business question with sensitive individual records, inspect BOTH the aggregate evidence AND the applicable data-handling policy.\n"
             "4. Group independent read calls in parallel (up to 6 per turn). Do NOT send Slack messages.\n\n"
             f"Candidate Skill Investigation Plans:\n{chr(10).join(plan_lines) or '- Cross-check Slack threads and enterprise records.'}\n\n"
             f"Service Discovery Guide:\n{session.service_guide}"
@@ -1690,6 +1818,7 @@ class OfficialDialSkillV2Agent:
         # Stage 2: PER-THREAD ISOLATED Symmetric-Evidence Dialectic Gating
         per_thread_gates: list[tuple[ThreadCandidate, Any, GateDecision]] = []
         gate_total_cost = 0.0
+        gate_total_uncached = 0.0
         gate_total_elapsed = 0.0
 
         async def _eval_one_thread(thread: ThreadCandidate, t_out: Any):
@@ -1704,16 +1833,23 @@ class OfficialDialSkillV2Agent:
                 skeptic_slate=iso_slate,
                 skill_store=self.skill_store,
             )
-            return thread, iso_slate, g_dec, g_cost, g_sec
+            g_unc = max(g_cost, getattr(self.gate_stage, "last_uncached_cost_usd", g_cost))
+            return thread, iso_slate, g_dec, g_cost, g_unc, g_sec
 
         gate_results = await asyncio.gather(*(_eval_one_thread(th, to) for th, to in surviving))
-        for th, iso_slate, g_dec, g_cost, g_sec in gate_results:
+        for th, iso_slate, g_dec, g_cost, g_unc, g_sec in gate_results:
             per_thread_gates.append((th, iso_slate, g_dec))
             gate_total_cost += g_cost
+            gate_total_uncached += g_unc
             gate_total_elapsed = max(gate_total_elapsed, g_sec)
 
         model_elapsed = recon.model_elapsed_sec + gate_total_elapsed
         total_cost = triage_cost + recon.cost_usd + gate_total_cost
+        uncached_cost = (
+            max(triage_cost, getattr(self.triage_client, "uncached_cost_usd", triage_cost))
+            + max(recon.cost_usd, recon.uncached_cost_usd)
+            + gate_total_uncached
+        )
         prompt_tokens = recon_pt
         completion_tokens = recon_ct
 
@@ -1779,28 +1915,10 @@ class OfficialDialSkillV2Agent:
 
         stage3_system = (
             f"{session.rendered_official_instruction}\n\n"
-            "=== DIAL-SKILL THREAD-ISOLATED ROUTING & VERIFICATION CONTRACT ===\n"
+            "=== DIAL-SKILL THREAD-ISOLATED ROUTING & COLLABORATIVE EXECUTION CONTRACT ===\n"
             f"{skill_contract_prompt}\n\n"
-            "GENERAL ENTERPRISE VERIFICATION & DELIVERY DISCIPLINE:\n"
-            "1. FOCUS ONLY ON APPROVED THREAD(S): Ignore any other channels/threads that were filtered out as "
-            "already handled. Do NOT post redundant replies to settled decoy threads.\n"
-            "2. VERIFY BEFORE AFFIRMING: Never blindly agree with a teammate's stated metric, billing rule, incident "
-            "recovery claim, credit amount, or proposed meeting slot. Complete any remaining multi-hop reads across "
-            "Linear, Notion, Stripe, HubSpot, PostHog, BigQuery, Snowflake, Calendar, Analytics, or Search Console "
-            "before sending a Slack message.\n"
-            "3. SEPARATE DISTINCT CASES, TIMEFRAMES & UNITS: Explicitly distinguish completed past patches from open "
-            "defects, non-production tests from production recovery, recurring calendar masters from single-date "
-            "exceptions, and event counts from distinct users or approvals.\n"
-            "4. MIXED-INTENT PRIVACY / GUARD RULE: If a thread asks a legitimate business/analytics question AND also "
-            "proposes sharing restricted or identifiable user data, DO NOT refuse the whole request and DO NOT disclose "
-            "restricted PII. Answer the safe aggregate/compliant portion directly in-thread, clearly explain the policy "
-            "boundary, and route any restricted follow-up to the recorded system owner + Security review.\n"
-            "5. CONCISE NON-REDUNDANT DELIVERY: Send ONE clear, well-structured Slack reply per affected thread/recipient "
-            "using `slack_reply_to_thread` (preferred for answering a thread), `slack_post_message`, or `slack_send_dm`. "
-            "Do NOT spam duplicate messages across DMs and channels.\n"
-            "6. STAGE-3 ABORT-TO-SILENT: If deeper verification reveals that EVERY approved thread is already properly "
-            "owned/handled with no remaining unmet need, send ZERO Slack messages and simply call `finish_task`.\n"
-            "7. Always end by calling `finish_task` with no arguments on its own."
+            f"{GENERAL_ENTERPRISE_DISCIPLINE_BLOCK}\n"
+            "5. Always end by calling `finish_task` with no arguments on its own."
         )
 
         approved_blocks = []
@@ -1840,6 +1958,19 @@ class OfficialDialSkillV2Agent:
         timed_out = False
         stop_reason = "max_turns"
         reminded_once = False
+        staged_writes: list[dict[str, Any]] = []
+        audit_rounds_done = 0
+        audit_verdict_log: list[dict[str, str]] = []
+
+        async def _commit_staged_writes() -> None:
+            for item in _consolidate_staged_writes(staged_writes):
+                await session.call_tool(
+                    item["tool"],
+                    item["arguments"],
+                    read_only=False,
+                    max_result_chars=self.max_result_chars,
+                )
+            staged_writes.clear()
 
         for _turn in range(self.stage3_max_turns):
             if model_elapsed >= model_budget_sec:
@@ -1858,6 +1989,7 @@ class OfficialDialSkillV2Agent:
             )
             model_elapsed += llm_res.elapsed_sec
             total_cost += llm_res.cost_usd
+            uncached_cost += llm_res.uncached_cost_usd
             prompt_tokens += llm_res.prompt_tokens
             completion_tokens += llm_res.completion_tokens
 
@@ -1928,17 +2060,93 @@ class OfficialDialSkillV2Agent:
                     executed_cache[call_key] = obs_str
                     messages.append({"role": "tool", "tool_call_id": tc_id, "content": obs_str})
                 else:
-                    _, obs_str = await session.call_tool(
-                        name,
-                        args,
-                        read_only=False,
-                        max_result_chars=self.max_result_chars,
-                    )
-                    messages.append({"role": "tool", "tool_call_id": tc_id, "content": obs_str})
+                    if self.enable_pre_delivery_audit:
+                        staged_writes.append({"tool": name, "arguments": args})
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tc_id,
+                                "content": json.dumps(
+                                    {
+                                        "ok": True,
+                                        "status": "staged_for_pre_delivery_audit",
+                                        "note": "Call finish_task when ready so Skeptic-Auditor can verify and deliver.",
+                                    }
+                                ),
+                            }
+                        )
+                    else:
+                        _, obs_str = await session.call_tool(
+                            name,
+                            args,
+                            read_only=False,
+                            max_result_chars=self.max_result_chars,
+                        )
+                        messages.append({"role": "tool", "tool_call_id": tc_id, "content": obs_str})
 
             if finished:
+                if self.enable_pre_delivery_audit and staged_writes:
+                    consolidated = _consolidate_staged_writes(staged_writes)
+                    if audit_rounds_done < 1 and model_elapsed < model_budget_sec:
+                        audit_rounds_done += 1
+                        ev_items = [
+                            f"- {k} => {v[:550]}" for k, v in list(executed_cache.items())[:18]
+                        ]
+                        staged_preview = json.dumps(consolidated, ensure_ascii=False, indent=2)
+                        audit_user = (
+                            f"Initial Slack Snapshot:\n{json.dumps(session.initial_context, ensure_ascii=False)}\n\n"
+                            f"Approved Thread Summary:\n" + "\n".join(approved_blocks) + "\n\n"
+                            f"Retrieved Read-Tool Evidence:\n" + ("\n".join(ev_items) or "(none)") + "\n\n"
+                            f"Staged Slack Write(s) Proposed by Executor:\n{staged_preview}"
+                        )
+                        audit_res = await self.openai_client.complete_json(
+                            model=self.executor_model,
+                            messages=[
+                                {"role": "system", "content": OFFICIAL_STAGE3_AUDITOR_SYSTEM_PROMPT},
+                                {"role": "user", "content": audit_user},
+                            ],
+                            json_schema=OFFICIAL_STAGE3_AUDITOR_JSON_SCHEMA,
+                            schema_name="official_stage3_pre_delivery_auditor",
+                            temperature=0.0,
+                            seed=self.seed,
+                            use_cache=False,
+                        )
+                        model_elapsed += audit_res.elapsed_sec
+                        total_cost += audit_res.cost_usd
+                        uncached_cost += audit_res.uncached_cost_usd
+                        prompt_tokens += audit_res.prompt_tokens
+                        completion_tokens += audit_res.completion_tokens
+                        a_data = dict(audit_res.parsed_json or {})
+                        verdict = str(a_data.get("audit_verdict", "APPROVE")).upper()
+                        critique = str(a_data.get("critique", "")).strip()
+                        audit_verdict_log.append({"verdict": verdict, "critique": critique})
+
+                        if verdict == "VETO_TO_SILENT":
+                            staged_writes.clear()
+                            stop_reason = "stage3_auditor_veto_to_silent"
+                            break
+                        if verdict == "REVISE" and model_elapsed < model_budget_sec:
+                            staged_writes.clear()
+                            messages.append(
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        f"[PRE-DELIVERY SKEPTIC-AUDITOR CRITIQUE — REVISION REQUIRED]\n"
+                                        f"{critique}\n\n"
+                                        "Your previous staged Slack write(s) were held back. Run any missing read check "
+                                        "if needed, stage ONE corrected, verified Slack message per unresolved thread "
+                                        "(or zero messages if resolved), and then call `finish_task`."
+                                    ),
+                                }
+                            )
+                            continue
+                    await _commit_staged_writes()
+
                 stop_reason = "finish_task" if session.delivered_messages else "stage3_abort_to_silent"
                 break
+
+        if self.enable_pre_delivery_audit and staged_writes and not session.delivered_messages:
+            await _commit_staged_writes()
 
         predicted: Literal["INTERVENE", "SILENT"] = (
             "INTERVENE" if len(session.delivered_messages) > 0 else "SILENT"
@@ -1963,6 +2171,8 @@ class OfficialDialSkillV2Agent:
             "approved_threads": [th.thread_id for th, _, _ in approved],
             "thread_gates": thread_gate_summary,
             "recon_calls": recon.tool_calls_used,
+            "pre_delivery_audit_enabled": self.enable_pre_delivery_audit,
+            "pre_delivery_audit_log": audit_verdict_log,
             "setup_seconds": session.setup_seconds,
         }
         if self.include_primary_slate_in_metadata:
@@ -1986,6 +2196,7 @@ class OfficialDialSkillV2Agent:
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_cost_usd=round(total_cost, 8),
+            uncached_cost_usd=round(max(total_cost, uncached_cost), 8),
             gate=final_gate,
             tool_trace=list(session.tool_trace),
             initial_context_summary=_summarize_initial_context(session.initial_context),
@@ -2157,11 +2368,15 @@ class DeepnoteOfficialJudge:
         *,
         openai_client: OpenAIClient,
         judge_model: str,
+        secondary_openai_client: OpenAIClient | None = None,
+        secondary_judge_model: str | None = None,
         num_passes: int = 2,
         seed: int = 42,
     ) -> None:
         self.openai_client = openai_client
         self.judge_model = judge_model
+        self.secondary_openai_client = secondary_openai_client
+        self.secondary_judge_model = secondary_judge_model
         self.num_passes = max(1, num_passes)
         self.seed = seed
 
@@ -2274,10 +2489,18 @@ class DeepnoteOfficialJudge:
             )
 
         pass_results: list[dict[str, Any]] = []
-        for pass_idx in range(self.num_passes):
+        if self.secondary_judge_model:
+            judge_pairs = [
+                (self.openai_client, self.judge_model),
+                (self.secondary_openai_client or self.openai_client, self.secondary_judge_model),
+            ]
+        else:
+            judge_pairs = [(self.openai_client, self.judge_model) for _ in range(self.num_passes)]
+
+        for pass_idx, (j_client, j_model) in enumerate(judge_pairs):
             prompt = self._build_blinded_prompt(task=task, episode=episode, pass_index=pass_idx)
-            res = await self.openai_client.complete_json(
-                model=self.judge_model,
+            res = await j_client.complete_json(
+                model=j_model,
                 messages=[
                     {"role": "system", "content": DEEPNOTE_STRICT_JUDGE_SYSTEM_PROMPT},
                     {"role": "user", "content": prompt},
@@ -2292,6 +2515,7 @@ class DeepnoteOfficialJudge:
                 delivered_count=len(episode.delivered_messages),
                 raw_payload=dict(res.parsed_json or {}),
             )
+            checked["judge_model"] = j_model
             pass_results.append(checked)
 
         def _mean_key(key: str) -> float:
@@ -2301,11 +2525,16 @@ class DeepnoteOfficialJudge:
         merged_mistakes = sorted(
             {m for p in pass_results for m in p.get("triggered_important_mistakes", [])}
         )
+        judge_tag = (
+            f"cross_family:{self.judge_model}+{self.secondary_judge_model}"
+            if self.secondary_judge_model
+            else f"dual{self.num_passes}:{self.judge_model}"
+        )
         return DeepnoteRubricJudgment(
             task_id=task.task_id,
             method=episode.method,
             model_id=episode.model_id,
-            judge_model=f"dual{self.num_passes}:{self.judge_model}",
+            judge_model=judge_tag,
             intervention_or_silence=_mean_key("intervention_or_silence"),
             correctness_and_evidence=_mean_key("correctness_and_evidence"),
             manner_of_intervention=_mean_key("manner_of_intervention"),
@@ -2373,8 +2602,18 @@ def summarize_official_8_results(
         total_tools += ep.tool_calls_used
         total_reads += ep.read_calls_used
         total_writes += ep.write_calls_used
-        total_cost += ep.total_cost_usd
+        ep_cost = (
+            ep.uncached_cost_usd
+            if getattr(ep, "uncached_cost_usd", 0.0) > 0.0
+            else ep.total_cost_usd
+        )
+        total_cost += ep_cost
         total_model_sec += ep.model_elapsed_sec
+
+    false_interruptions = sil_total - sil_correct
+    missed_interventions = act_total - act_correct
+    multi_write_spam = sum(1 for ep in episodes if ep.write_calls_used >= 3)
+    content_or_policy_zeros = max(0, serious_zeros - false_interruptions - missed_interventions)
 
     n = len(episodes)
     avg = lambda xs: round(sum(xs) / len(xs), 4) if xs else None
@@ -2390,6 +2629,12 @@ def summarize_official_8_results(
         "action_recall": round(act_correct / act_total, 4) if act_total else None,
         "action_correct": f"{act_correct}/{act_total}",
         "serious_mistake_zeros": serious_zeros,
+        "error_taxonomy": {
+            "false_interruptions": false_interruptions,
+            "missed_interventions": missed_interventions,
+            "content_or_policy_serious_zeros": content_or_policy_zeros,
+            "multi_write_spam_episodes": multi_write_spam,
+        },
         "avg_tool_calls": round(total_tools / n, 2),
         "avg_read_calls": round(total_reads / n, 2),
         "avg_write_calls": round(total_writes / n, 2),
@@ -2409,7 +2654,11 @@ __all__ = [
     "DeepnoteRubricJudgment",
     "DeliveredSlackMessage",
     "FINISH_TASK_OPENAI_TOOL",
+    "GENERAL_ENTERPRISE_DISCIPLINE_BLOCK",
+    "OFFICIAL_STAGE3_AUDITOR_JSON_SCHEMA",
+    "OFFICIAL_STAGE3_AUDITOR_SYSTEM_PROMPT",
     "OfficialDirectAgent",
+    "OfficialPromptMatchedDirectAgent",
     "OfficialDialSkillAgent",
     "OfficialDialSkillV2Agent",
     "OfficialEpisodeResult",

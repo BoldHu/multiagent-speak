@@ -138,11 +138,11 @@ def generate_tab_online_evolution(rows: Sequence[dict[str, Any]], out_path: str 
 
 
 def generate_tab_ablations(rows: Sequence[dict[str, Any]], out_path: str | Path) -> Path:
-    """Generate tab_ablations.tex (Exp 4: 7-point systematic ablation study)."""
+    """Generate tab_ablations.tex (Systematic ablation study across When2Speak & PageMantle)."""
     lines = [
         "\\begin{table}[t]",
         "\\centering",
-        "\\caption{Systematic 7-point ablation study on When2Speak-Main and held-out \\texttt{pm\\_eval\\_32}.}",
+        "\\caption{Systematic ablation study across When2Speak-Main (validation-calibrated per variant) and held-out PageMantle-Hard (\\texttt{pm\\_hard\\_eval\\_32}).}",
         "\\label{tab:ablations}",
         "\\resizebox{\\linewidth}{!}{%",
         "\\begin{tabular}{lccccc}",
@@ -155,6 +155,35 @@ def generate_tab_ablations(rows: Sequence[dict[str, Any]], out_path: str | Path)
             f"{_tex_escape(r.get('variant', ''))} & {_fmt(r.get('w2s_macro_f1'), 3)} & "
             f"{_fmt(r.get('w2s_fir'), 3)} & {_fmt(r.get('pm_overall'), 2)} & "
             f"{_fmt(r.get('pm_audience'), 2)} & {_fmt(r.get('token_reduction_pct'), 1)} \\\\"
+        )
+    lines.extend(["\\bottomrule", "\\end{tabular}%", "}", "\\end{table}", ""])
+    p = Path(out_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("\n".join(lines), encoding="utf-8")
+    return p
+
+
+def generate_tab_utterance_quality(rows: Sequence[dict[str, Any]], out_path: str | Path) -> Path:
+    """Generate tab_utterance_quality.tex evaluating When2Speak response quality against gold references."""
+    lines = [
+        "\\begin{table}[t]",
+        "\\centering",
+        "\\caption{Utterance quality on stratified \\textbf{When2Speak} gold \\texttt{SPEAK} turns graded blindly by cross-family Dual-Judge (0--10) against human reference responses.}",
+        "\\label{tab:utterance_quality}",
+        "\\resizebox{\\linewidth}{!}{%",
+        "\\begin{tabular}{llcccccc}",
+        "\\toprule",
+        "\\textbf{Method} & \\textbf{Backbone} & \\textbf{Overall} $\\uparrow$ & \\textbf{Helpfulness} & \\textbf{Conciseness} & \\textbf{Appropriateness} & \\textbf{Avg Words} & \\textbf{Perm. $p$} \\\\",
+        "\\midrule",
+    ]
+    for r in rows:
+        pval = r.get("perm_p")
+        p_str = "--" if pval is None else ("$<$0.001" if float(pval) < 0.001 else _fmt(pval, 3))
+        lines.append(
+            f"{_tex_escape(r.get('method', ''))} & {_tex_escape(r.get('model', ''))} & "
+            f"\\textbf{{{_fmt(r.get('overall_score'), 2)}}} & {_fmt(r.get('helpfulness'), 2)} & "
+            f"{_fmt(r.get('conciseness'), 2)} & {_fmt(r.get('appropriateness'), 2)} & "
+            f"{_fmt(r.get('avg_words'), 1)} & {p_str} \\\\"
         )
     lines.extend(["\\bottomrule", "\\end{tabular}%", "}", "\\end{table}", ""])
     p = Path(out_path)
@@ -342,7 +371,7 @@ def plot_prompt_length_o1(
     awm_tokens: Sequence[int] | None,
     out_path: str | Path,
 ) -> Path:
-    """Generate fig_prompt_length_o1.pdf proving O(1) prompt stability vs Reflexion O(T) bloat."""
+    """Generate fig_prompt_length_o1.pdf illustrating bounded O(1) prompt capacity vs Reflexion O(T) growth."""
     p = Path(out_path)
     p.parent.mkdir(parents=True, exist_ok=True)
 
@@ -459,7 +488,7 @@ def generate_tab_cross_model_when2speak(rows: Sequence[dict[str, Any]], out_path
         "\\resizebox{\\linewidth}{!}{%",
         "\\begin{tabular}{llccccccc}",
         "\\toprule",
-        "\\textbf{Family} & \\textbf{Model} & \\textbf{Direct F1} & \\textbf{DIAL F1} $\\uparrow$ & \\textbf{$\\Delta$ F1} & \\textbf{Direct FIR} & \\textbf{DIAL FIR} $\\downarrow$ & \\textbf{DIAL AUROC} & \\textbf{McNemar $p$} \\\\",
+        "\\textbf{Family} & \\textbf{Model} & \\textbf{Direct F1} & \\textbf{DIAL F1} $\\uparrow$ & \\textbf{$\\Delta$ F1} & \\textbf{Direct FIR} & \\textbf{DIAL FIR} $\\downarrow$ & \\textbf{DIAL AUROC} & \\textbf{Holm $p$} \\\\",
         "\\midrule",
     ]
     for r in rows:
@@ -467,7 +496,7 @@ def generate_tab_cross_model_when2speak(rows: Sequence[dict[str, Any]], out_path
         o_f1 = r.get("dial_macro_f1")
         delta = (float(o_f1) - float(d_f1)) if (d_f1 is not None and o_f1 is not None) else None
         delta_str = f"{delta:+.3f}" if delta is not None else "--"
-        pval = r.get("mcnemar_p")
+        pval = r.get("holm_bootstrap_p", r.get("bootstrap_p", r.get("mcnemar_p")))
         p_str = "$<$0.001" if (isinstance(pval, (int, float)) and pval < 0.001) else _fmt(pval, 3)
         lines.append(
             f"{_tex_escape(r.get('family', ''))} & {_tex_escape(r.get('model', ''))} & "

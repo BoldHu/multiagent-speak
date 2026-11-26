@@ -347,3 +347,111 @@ def test_runner_resume_idempotency_calibration_and_pareto_sweep(tmp_path: Path) 
     assert len(pareto) == 3
     assert all("fir" in row and "mir" in row for row in pareto)
     assert pareto_rev == pareto
+
+
+def test_direct_sc3_continuous_proact_platt_calibration_and_statistical_tests(tmp_path: Path) -> None:
+    from dial_skill.baselines.direct_chat import DirectSelfConsistencyBaseline
+    from dial_skill.eval.metrics import (
+        holm_bonferroni_correction,
+        paired_bootstrap_test,
+        paired_nonparametric_test,
+    )
+    from dial_skill.eval.runners import (
+        apply_1d_threshold_to_episodes,
+        calibrate_1d_score_threshold,
+        calibrate_platt_from_validation,
+        sweep_full_pareto_frontier,
+    )
+
+    fake = _BaselineFakeOpenAI()
+    oai = OpenAIClient(api_key="k", cache=SQLiteAPICache(tmp_path / "sc.sqlite"), async_client=fake)
+    sc3 = DirectSelfConsistencyBaseline(openai_client=oai, model="gpt-4.1-mini", n_samples=3)
+    ep_sc = asyncio.run(
+        sc3.run_episode(
+            sample_id="sc_1",
+            conversation_id="c1",
+            channel_name="#g",
+            messages=[ChatMessage(msg_id="m1", speaker="a", text="Can someone help?")],
+            benchmark="when2speak",
+        )
+    )
+    assert ep_sc.gate.binary_speak is True
+    assert ep_sc.metadata["vote_prob"] == 1.0
+    assert ep_sc.uncached_cost_usd > 0.0
+
+    # 1D threshold calibration + Platt scaling on skewed validation base rate
+    val_turns = [
+        When2SpeakTurn(
+            sample_id=f"v_{i}",
+            conversation_id=f"vc_{i}",
+            turn_index=0,
+            split="validation",
+            messages=[ChatMessage(msg_id=f"vm_{i}", speaker="a", text="help" if i < 2 else "chat")],
+            label_speak=(i < 2),
+        )
+        for i in range(10)
+    ]
+    val_eps = [
+        EpisodeResult(
+            sample_id=f"v_{i}",
+            benchmark="when2speak",
+            method="m",
+            model_id="gpt-4.1-mini",
+            gate=GateDecision(
+                slate_hash="h",
+                selected_skill="none",
+                advocate_score=0.82 if i < 2 else (0.55 if i == 2 else 0.15),
+                skeptic_score=0.18 if i < 2 else (0.45 if i == 2 else 0.85),
+                margin_delta=0.64 if i < 2 else (0.10 if i == 2 else -0.70),
+                disagreement_u=0.1,
+                raw_tier=InterventionTier.THREAD_BRIEF,
+                final_tier=InterventionTier.THREAD_BRIEF,
+                binary_speak=(i <= 2),
+            ),
+            total_cost_usd=0.0,
+            uncached_cost_usd=0.002,
+        )
+        for i in range(10)
+    ]
+    cal_1d = calibrate_1d_score_threshold(val_turns=val_turns, val_episodes=val_eps)
+    assert cal_1d["best_threshold"] > 0.55
+    assert cal_1d["val_macro_f1"] == 1.0
+    rescored = apply_1d_threshold_to_episodes(val_eps, cal_1d["best_threshold"])
+    probs, platt_meta = calibrate_platt_from_validation(
+        val_turns=val_turns, val_episodes=rescored, eval_episodes=rescored
+    )
+    m_platt = compute_when2speak_metrics([t.label_speak for t in val_turns], rescored, calibrated_probs=probs)
+    assert m_platt["macro_f1"] == 1.0
+    assert m_platt["ece_is_platt_calibrated"] is True
+    assert m_platt["ece"] < 0.20
+    assert m_platt["total_cost_usd"] == 0.02  # Uncached cost reported even when billed_cost_usd == 0!
+    assert m_platt["billed_cost_usd"] == 0.0
+    assert "platt_slope" in platt_meta
+
+    # Infeasible joint FIR+MIR constraints fall back cleanly to optimal Macro-F1 (never degenerate boundary)
+    cal_infeasible = calibrate_when2speak_thresholds(
+        val_turns=val_turns, val_episodes=val_eps, max_fir=0.0, max_mir=0.0, theta_floor=0.20
+    )
+    assert cal_infeasible["val_macro_f1"] == 1.0
+
+    frontier = sweep_full_pareto_frontier(turns=val_turns, episodes=val_eps)
+    assert len(frontier) >= 1
+
+    # Statistical tests: paired bootstrap on Macro-F1, paired permutation/Wilcoxon, Holm-Bonferroni
+    y_stat = [True, True, False, False, False, False, True, False, False, False] * 4
+    pred_good = y_stat
+    pred_bad = [False] * len(y_stat)
+    pb = paired_bootstrap_test(y_stat, pred_good, pred_bad, n_bootstrap=500)
+    assert pb["delta_macro_f1"] > 0.4
+    assert pb["p_value"] < 0.05
+
+    pnp = paired_nonparametric_test([9.0, 8.5, 10.0, 9.0, 8.0, 9.5, 8.5, 9.0], [5.0, 4.0, 10.0, 3.0, 4.0, 5.0, 4.0, 4.5])
+    assert pnp["mean_diff"] > 3.0
+    assert pnp["permutation_p_value"] < 0.02
+    assert pnp["wilcoxon_p_value"] < 0.05
+
+    holm = holm_bonferroni_correction({"m1": 0.002, "m2": 0.015, "m3": 0.40})
+    assert holm["m1"]["significant_at_alpha"] is True
+    assert holm["m2"]["significant_at_alpha"] is True
+    assert holm["m3"]["significant_at_alpha"] is False
+

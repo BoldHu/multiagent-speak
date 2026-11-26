@@ -85,6 +85,7 @@ class GateConfig(BaseModel):
     tau_disagreement: float = 0.55
     skeptic_channel_cap_threshold: float = 0.60
     skill_prior_override_floor: float = 0.10
+    deliberative_rebuttal_min_adv: float = 0.35
     temperature: float = 0.0
 
 
@@ -94,6 +95,8 @@ class ExecutorConfig(BaseModel):
     default_max_tool_calls: int = 7
     tool_output_max_chars: int = 3000
     temperature: float = 0.2
+    enable_pre_delivery_audit: bool = False
+    max_audit_revisions: int = 1
 
 
 class EvolutionConfig(BaseModel):
@@ -116,11 +119,16 @@ class AblationConfig(BaseModel):
     triage_backend_override: Literal["jev", "openai_fallback"] | None = None  # A2
     asymmetric_evidence: bool = False  # A3
     gate_mode: Literal[
-        "dual_margin", "advocate_only", "skeptic_only", "single_combined"
-    ] = "dual_margin"  # A4
+        "dual_margin",
+        "deliberative_collab",
+        "advocate_only",
+        "skeptic_only",
+        "single_combined",
+    ] = "dual_margin"  # A4 / Closed-loop deliberative collaboration
     binary_only: bool = False  # A5
     disable_disagreement_deesc: bool = False  # A6
     disable_skill_routing: bool = False  # A7
+    disable_pre_delivery_audit: bool = False  # A8 (Stage-3 Draft-Audit-Refine ablation)
 
 
 class DialSkillConfig(BaseModel):

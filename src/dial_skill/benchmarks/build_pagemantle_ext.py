@@ -354,21 +354,31 @@ async def build_pagemantle_ext_suite(
     def _pick_fact(cursor: int) -> dict[str, Any]:
         return facts[cursor % len(facts)]
 
-    # 1. Load official 8 tasks (or construct DB-grounded fallback placeholders if repo not cloned yet)
+    # 1. Load official 8 tasks (or construct DB-grounded synthetic sanity fallback if repo not cloned)
     official_tasks = load_official_tasks(benchmark_repo_dir=benchmark_repo_dir)
-    if len(official_tasks) < 8:
+    used_synthetic_sanity_fallback = len(official_tasks) < 8
+    if used_synthetic_sanity_fallback:
         for i in range(len(official_tasks), 8):
             cat = ACTIVE_SKILLS[i % len(ACTIVE_SKILLS)]
+            syn_task = _synthesize_deterministic_thread(
+                task_id=f"pm_synthetic_sanity_{i + 1:02d}",
+                split="pm_official_8",
+                wave=None,
+                category=cat,
+                fact=_pick_fact(i),
+                expected_action="INTERVENE",
+                trap_type=None,
+                rng=rng,
+            )
             official_tasks.append(
-                _synthesize_deterministic_thread(
-                    task_id=f"pm_official_{i + 1:02d}",
-                    split="pm_official_8",
-                    wave=None,
-                    category=cat,
-                    fact=_pick_fact(i),
-                    expected_action="INTERVENE",
-                    trap_type=None,
-                    rng=rng,
+                syn_task.model_copy(
+                    update={
+                        "metadata": {
+                            **syn_task.metadata,
+                            "is_synthetic_sanity_fallback": True,
+                            "canonical_split_alias": "pm_synthetic_sanity_8",
+                        }
+                    }
                 )
             )
     official_tasks = official_tasks[:8]
@@ -444,11 +454,18 @@ async def build_pagemantle_ext_suite(
         return p
 
     _write_split("pm_official_8.jsonl", official_tasks)
+    if used_synthetic_sanity_fallback:
+        sanity_named = [
+            t.model_copy(update={"split": "pm_synthetic_sanity_8"}) for t in official_tasks
+        ]
+        _write_split("pm_synthetic_sanity_8.jsonl", sanity_named)
     _write_split("pm_online_stream_24.jsonl", online_stream)
     _write_split("pm_eval_32.jsonl", eval_set)
 
     audit_report = {
         "total_tasks": len(official_tasks) + len(online_stream) + len(eval_set),
+        "benchmark_role": "synthetic_sanity_suite_grounded_on_pagemantle_db",
+        "official_tasks_are_synthetic_fallback": used_synthetic_sanity_fallback,
         "isolation": isolation_report,
         "db_grounding_passed": len(grounding_failures) == 0,
         "db_grounding_failures": grounding_failures,

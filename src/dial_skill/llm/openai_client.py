@@ -48,6 +48,7 @@ class LLMCallResult(BaseModel):
     prompt_tokens: int = 0
     completion_tokens: int = 0
     cost_usd: float = 0.0
+    uncached_cost_usd: float = 0.0
     elapsed_sec: float = 0.0
     from_cache: bool = False
 
@@ -57,12 +58,14 @@ class UsageTracker:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_cost_usd: float = 0.0
+    uncached_cost_usd: float = 0.0
     api_calls: int = 0
     cache_hits: int = 0
     model_elapsed_sec: float = 0.0
     per_model_calls: dict[str, int] = field(default_factory=dict)
 
     def record(self, res: LLMCallResult) -> None:
+        self.uncached_cost_usd += res.uncached_cost_usd
         if res.from_cache:
             self.cache_hits += 1
         else:
@@ -192,14 +195,18 @@ class OpenAIClient:
                 seed=seed,
             )
             if cached is not None:
+                c_ptok = int(cached.get("prompt_tokens", 0))
+                c_ctok = int(cached.get("completion_tokens", 0))
+                est_uncached = self.estimate_cost_usd(model, c_ptok, c_ctok)
                 res = LLMCallResult(
                     content=cached.get("content", ""),
                     parsed_json=cached.get("parsed_json"),
                     tool_calls=cached.get("tool_calls", []),
                     model=model,
-                    prompt_tokens=int(cached.get("prompt_tokens", 0)),
-                    completion_tokens=int(cached.get("completion_tokens", 0)),
+                    prompt_tokens=c_ptok,
+                    completion_tokens=c_ctok,
                     cost_usd=0.0,
+                    uncached_cost_usd=est_uncached,
                     elapsed_sec=0.0,
                     from_cache=True,
                 )
@@ -357,6 +364,7 @@ class OpenAIClient:
             prompt_tokens=p_tok,
             completion_tokens=c_tok,
             cost_usd=cost,
+            uncached_cost_usd=cost,
             elapsed_sec=elapsed,
             from_cache=False,
         )

@@ -21,6 +21,7 @@ gate:
   tau_disagreement: 0.55
   skeptic_channel_cap_threshold: 0.60
   skill_prior_override_floor: 0.10
+  deliberative_rebuttal_min_adv: 0.35
   temperature: 0.0
 
 executor:
@@ -29,6 +30,8 @@ executor:
   default_max_tool_calls: 7
   tool_output_max_chars: 3000
   temperature: 0.2
+  enable_pre_delivery_audit: false
+  max_audit_revisions: 1
 
 evolution:
   eta_fp: 0.04
@@ -48,7 +51,8 @@ ablation:
   disable_triage: false                # A1: raw full chat directly to Advocate/Skeptic
   triage_backend_override: null        # A2: "openai_fallback" vs "jev"
   asymmetric_evidence: false           # A3: Advocate and Skeptic get asymmetrically filtered slates
-  gate_mode: "dual_margin"             # A4: "dual_margin" | "advocate_only" | "skeptic_only" | "single_combined"
+  gate_mode: "dual_margin"             # A4: "dual_margin" | "deliberative_collab" | "advocate_only" | "skeptic_only" | "single_combined"
   binary_only: false                   # A5: collapse tiers to SILENT / CHANNEL_INTERVENE
   disable_disagreement_deesc: false    # A6: disable U_t epistemic disagreement de-escalation
   disable_skill_routing: false         # A7: generic prompt instead of 8 Dual-Boundary Skills
+  disable_pre_delivery_audit: false    # A8: disable Stage-3 Pre-Delivery Skeptic-Auditor

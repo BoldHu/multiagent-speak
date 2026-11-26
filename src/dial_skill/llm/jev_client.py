@@ -338,6 +338,7 @@ class OpenAILunaTriageFallback:
         self.openai_client = openai_client
         self.model = model
         self.seed = seed
+        self.last_uncached_cost_usd: float = 0.0
 
     async def score_message(
         self,
@@ -372,6 +373,7 @@ class OpenAILunaTriageFallback:
         item = parse_jev_response_to_triage_item(
             data, msg_id=target_message.msg_id, backend="openai_fallback"
         )
+        self.last_uncached_cost_usd = res.uncached_cost_usd
         return item, res.cost_usd
 
 
@@ -414,6 +416,7 @@ class TriageClient:
         self.fallback_count: int = 0
         self.cache_hits: int = 0
         self.total_cost_usd: float = 0.0
+        self.uncached_cost_usd: float = 0.0
         self.fallback_reasons: list[str] = []
         self._jev_circuit_open_reason: str | None = None
         self._consecutive_jev_failures: int = 0
@@ -546,10 +549,12 @@ class TriageClient:
         active_backend = backend_override or self.backend
 
         if active_backend == "openai_fallback":
-            item, cost = await self._get_fallback().score_message(
+            fb = self._get_fallback()
+            item, cost = await fb.score_message(
                 channel_name, prior_messages, target_message
             )
             self.total_cost_usd += cost
+            self.uncached_cost_usd += max(cost, fb.last_uncached_cost_usd)
             return item
 
         state_payload = build_jev_state_payload(channel_name, prior_messages, target_message)
@@ -586,6 +591,7 @@ class TriageClient:
                 )
         if cached is not None:
             self.cache_hits += 1
+            self.uncached_cost_usd += float(self.models_cfg.jev.cost_per_call_usd)
             return TriageItem.model_validate(cached).model_copy(update={"msg_id": target_message.msg_id})
 
         # 2. If circuit breaker tripped (e.g., quota exhausted / auth error / missing key), fall back cleanly
@@ -616,7 +622,9 @@ class TriageClient:
                 )
                 self.jev_calls += 1
                 self._consecutive_jev_failures = 0
-                self.total_cost_usd += float(self.models_cfg.jev.cost_per_call_usd)
+                call_cost = float(self.models_cfg.jev.cost_per_call_usd)
+                self.total_cost_usd += call_cost
+                self.uncached_cost_usd += call_cost
                 return item
             except Exception as exc:
                 last_error = exc
@@ -660,10 +668,12 @@ class TriageClient:
             self._luna_model,
             self.fallback_count,
         )
-        item, cost = await self._get_fallback().score_message(
+        fb = self._get_fallback()
+        item, cost = await fb.score_message(
             channel_name, prior_messages, target_message
         )
         self.total_cost_usd += cost
+        self.uncached_cost_usd += max(cost, fb.last_uncached_cost_usd)
         return item
 
     def get_run_metadata(self) -> dict[str, Any]:
@@ -675,4 +685,5 @@ class TriageClient:
             "jev_circuit_open_reason": self._jev_circuit_open_reason,
             "fallback_reasons_sample": self.fallback_reasons[:5],
             "triage_cost_usd": round(self.total_cost_usd, 6),
+            "triage_uncached_cost_usd": round(self.uncached_cost_usd, 6),
         }

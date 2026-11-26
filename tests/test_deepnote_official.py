@@ -236,6 +236,54 @@ def test_summarize_official_8_results() -> None:
     assert summary["action_recall"] == 1.0
     assert summary["avg_read_calls"] == 3.5
     assert summary["avg_write_calls"] == 0.5
+    assert summary["error_taxonomy"]["false_interruptions"] == 0
+    assert summary["error_taxonomy"]["missed_interventions"] == 0
+
+
+def test_zero_test_set_contamination_and_prompt_matched_direct_and_consolidation(tmp_path: Path) -> None:
+    from dial_skill.benchmarks.deepnote_official import (
+        GENERAL_ENTERPRISE_DISCIPLINE_BLOCK,
+        OfficialPromptMatchedDirectAgent,
+        _consolidate_staged_writes,
+    )
+    from dial_skill.llm.openai_client import OpenAIClient
+    from dial_skill.utils.cache import SQLiteAPICache
+
+    # 1. Programmatically guarantee ZERO Official-8 task-specific contamination in source prompts
+    src_files = [
+        REPO_ROOT / "src" / "dial_skill" / "benchmarks" / "deepnote_official.py",
+        REPO_ROOT / "src" / "dial_skill" / "prompts" / "templates.py",
+    ]
+    banned_leaks = [
+        "non-production tests from production recovery",
+        "recurring calendar masters from single-date",
+        "completed past patches from open defects",
+        "event counts from distinct users",
+        "recorded system owner + Security review",
+    ]
+    for fpath in src_files:
+        text = fpath.read_text(encoding="utf-8")
+        for phrase in banned_leaks:
+            assert phrase not in text, f"Contamination phrase {phrase!r} found in {fpath}"
+
+    # 2. Verify Prompt-Matched Direct receives exact same general discipline guidelines
+    oai = OpenAIClient(api_key="k", cache=SQLiteAPICache(tmp_path / "pm_d.sqlite"))
+    pm_direct = OfficialPromptMatchedDirectAgent(openai_client=oai, model="gpt-4.1")
+    assert pm_direct.method_name == "B0_prompt_matched_direct"
+    assert pm_direct.extra_system_instructions == GENERAL_ENTERPRISE_DISCIPLINE_BLOCK
+
+    # 3. Verify staged Slack write consolidation eliminates multi-message spam on same thread
+    spam_writes = [
+        {"tool": "slack_reply_to_thread", "arguments": {"channel_id": "C1", "thread_ts": "10.1", "text": "Part A"}},
+        {"tool": "slack_reply_to_thread", "arguments": {"channel_id": "C1", "thread_ts": "10.1", "text": "Part A"}},
+        {"tool": "slack_reply_to_thread", "arguments": {"channel_id": "C1", "thread_ts": "10.1", "text": "Part B"}},
+        {"tool": "slack_send_dm", "arguments": {"user_id": "U2", "text": "FYI DM"}},
+    ]
+    consolidated = _consolidate_staged_writes(spam_writes)
+    assert len(consolidated) == 2
+    assert consolidated[0]["arguments"]["text"] == "Part A\n\nPart B"
+    assert consolidated[1]["tool"] == "slack_send_dm"
+
 
 
 def test_notebook_08_validates_cleanly() -> None:

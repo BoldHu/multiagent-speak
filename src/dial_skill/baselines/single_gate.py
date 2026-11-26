@@ -62,7 +62,12 @@ class SingleGateBaseline:
         conversation_id: str,
         channel_name: str,
         messages: list[ChatMessage],
-        benchmark: Literal["when2speak", "pagemantle_official", "pagemantle_ext"],
+        benchmark: Literal[
+            "when2speak",
+            "pagemantle_official",
+            "pagemantle_ext",
+            "pagemantle_synthetic_sanity",
+        ],
         tool_env: ToolEnvironment | None = None,
         generate_text: bool = True,
     ) -> EpisodeResult:
@@ -71,6 +76,7 @@ class SingleGateBaseline:
         raw_hash = compute_slate_hash(raw_text)
 
         cost = 0.0
+        uncached_cost = 0.0
         model_elapsed = 0.0
         rationale = ""
         triage_used = "none"
@@ -79,12 +85,18 @@ class SingleGateBaseline:
             if self.triage_client is None:
                 raise ValueError("SingleGateBaseline(gate_source='jev') requires triage_client.")
             cost_before = self.triage_client.total_cost_usd
+            uncached_before = getattr(self.triage_client, "uncached_cost_usd", cost_before)
             item = await self.triage_client.score_message(
                 channel_name=channel_name,
                 prior_messages=messages[:-1],
                 target_message=messages[-1],
             )
             cost += max(0.0, self.triage_client.total_cost_usd - cost_before)
+            uncached_cost += max(
+                cost,
+                getattr(self.triage_client, "uncached_cost_usd", self.triage_client.total_cost_usd)
+                - uncached_before,
+            )
             speak_prob = float(item.p_decision_change * item.stance_probs.get("need_signal", 0.0))
             rationale = f"jev_stance={item.stance}, p_chg={item.p_decision_change:.2f}"
             triage_used = item.backend
@@ -101,6 +113,7 @@ class SingleGateBaseline:
                 seed=self.seed,
             )
             cost += res.cost_usd
+            uncached_cost += res.uncached_cost_usd
             model_elapsed += res.elapsed_sec
             data = res.parsed_json or {}
             speak_prob = max(0.0, min(1.0, float(data.get("speak_probability", 0.0))))
@@ -160,6 +173,7 @@ class SingleGateBaseline:
                 )
                 model_elapsed += llm_res.elapsed_sec
                 cost += llm_res.cost_usd
+                uncached_cost += llm_res.uncached_cost_usd
                 if model_elapsed > self.hard_time_cap_sec:
                     timed_out = True
                     response_text = llm_res.content.strip() or None
@@ -217,6 +231,7 @@ class SingleGateBaseline:
             prompt_tokens_raw=raw_tokens,
             prompt_tokens_slate=raw_tokens,
             total_cost_usd=round(cost, 8),
+            uncached_cost_usd=round(max(cost, uncached_cost), 8),
             triage_backend_used=triage_used,
             metadata={"rationale": rationale, "speak_probability": speak_prob},
         )

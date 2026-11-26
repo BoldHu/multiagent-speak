@@ -6,7 +6,8 @@ import math
 from typing import Any, Callable, Sequence
 
 import numpy as np
-from scipy.stats import binomtest
+from scipy.stats import binomtest, wilcoxon
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import average_precision_score, f1_score, precision_score, recall_score, roc_auc_score
 
 from dial_skill.schemas import (
@@ -20,6 +21,33 @@ from dial_skill.schemas import (
 
 def _sigmoid(x: np.ndarray) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-np.clip(x, -20.0, 20.0)))
+
+
+def fit_platt_parameters(
+    y_true: Sequence[int | bool],
+    scores: Sequence[float],
+) -> tuple[float, float]:
+    """Fit 1D Platt scaling `P(y=1|s) = sigmoid(a * s + b)` strictly on validation data."""
+    y = np.asarray([int(bool(v)) for v in y_true], dtype=int)
+    s = np.asarray(scores, dtype=float).reshape(-1, 1)
+    if len(y) == 0:
+        return 1.0, 0.0
+    pos_rate = float(np.clip(np.mean(y), 1e-4, 1.0 - 1e-4))
+    if len(set(y.tolist())) < 2 or float(np.std(s)) < 1e-8:
+        return 0.0, float(math.log(pos_rate / (1.0 - pos_rate)))
+    clf = LogisticRegression(C=50.0, solver="lbfgs", max_iter=500)
+    clf.fit(s, y)
+    return float(clf.coef_[0][0]), float(clf.intercept_[0])
+
+
+def apply_platt_scaling(
+    scores: Sequence[float],
+    slope_a: float,
+    intercept_b: float,
+) -> np.ndarray:
+    """Apply validation-fitted Platt parameters `(a, b)` to map raw margins to calibrated probabilities."""
+    s = np.asarray(scores, dtype=float)
+    return _sigmoid(slope_a * s + intercept_b)
 
 
 def compute_ece(
@@ -81,6 +109,135 @@ def mcnemar_test(
     }
 
 
+def paired_bootstrap_test(
+    y_true: Sequence[int | bool],
+    pred_a: Sequence[int | bool],
+    pred_b: Sequence[int | bool],
+    n_bootstrap: int = 5000,
+    seed: int = 42,
+) -> dict[str, float]:
+    """Paired bootstrap hypothesis test & 95% CI directly on Delta Macro-F1 = F1(A) - F1(B)."""
+    yt = np.asarray([int(bool(x)) for x in y_true], dtype=int)
+    pa = np.asarray([int(bool(x)) for x in pred_a], dtype=int)
+    pb = np.asarray([int(bool(x)) for x in pred_b], dtype=int)
+    if not (len(yt) == len(pa) == len(pb)):
+        raise ValueError("paired_bootstrap_test requires equal-length sequences.")
+    n = len(yt)
+    if n == 0:
+        return {"delta_macro_f1": 0.0, "ci95_low": 0.0, "ci95_high": 0.0, "p_value": 1.0}
+
+    obs_a = float(f1_score(yt, pa, average="macro", zero_division=0))
+    obs_b = float(f1_score(yt, pb, average="macro", zero_division=0))
+    obs_delta = obs_a - obs_b
+
+    rng = np.random.default_rng(seed)
+    deltas = np.empty(n_bootstrap, dtype=float)
+    for i in range(n_bootstrap):
+        idx = rng.integers(0, n, size=n)
+        fa = float(f1_score(yt[idx], pa[idx], average="macro", zero_division=0))
+        fb = float(f1_score(yt[idx], pb[idx], average="macro", zero_division=0))
+        deltas[i] = fa - fb
+
+    ci_lo = float(np.quantile(deltas, 0.025))
+    ci_hi = float(np.quantile(deltas, 0.975))
+    # Two-sided paired bootstrap p-value via centered shift / tail mass
+    p_le = float(np.mean(deltas <= 0.0))
+    p_ge = float(np.mean(deltas >= 0.0))
+    pval = min(1.0, 2.0 * min(p_le, p_ge))
+    return {
+        "macro_f1_a": round(obs_a, 6),
+        "macro_f1_b": round(obs_b, 6),
+        "delta_macro_f1": round(obs_delta, 6),
+        "ci95_low": round(ci_lo, 6),
+        "ci95_high": round(ci_hi, 6),
+        "p_value": round(pval, 8),
+    }
+
+
+def paired_nonparametric_test(
+    scores_a: Sequence[float],
+    scores_b: Sequence[float],
+    n_permutations: int = 10000,
+    seed: int = 42,
+) -> dict[str, float]:
+    """Paired sign-flip permutation test + Wilcoxon signed-rank test + 95% CI on task-level scores."""
+    sa = np.asarray(scores_a, dtype=float)
+    sb = np.asarray(scores_b, dtype=float)
+    if len(sa) != len(sb):
+        raise ValueError("paired_nonparametric_test requires equal-length score arrays.")
+    n = len(sa)
+    if n == 0:
+        return {
+            "mean_diff": 0.0,
+            "ci95_low": 0.0,
+            "ci95_high": 0.0,
+            "permutation_p_value": 1.0,
+            "wilcoxon_p_value": 1.0,
+        }
+    diffs = sa - sb
+    obs_diff = float(np.mean(diffs))
+    ci = bootstrap_ci(diffs, n_bootstrap=2000, seed=seed)
+
+    # Exact sign-flip enumeration when n <= 16, else Monte Carlo sign-flip permutation
+    if n <= 16:
+        signs = np.array(
+            [[1.0 if ((mask >> j) & 1) else -1.0 for j in range(n)] for mask in range(1 << n)],
+            dtype=float,
+        )
+        perm_means = (signs @ diffs) / float(n)
+        perm_p = float(np.mean(np.abs(perm_means) >= abs(obs_diff) - 1e-12))
+    else:
+        rng = np.random.default_rng(seed)
+        signs = rng.choice(np.array([-1.0, 1.0]), size=(n_permutations, n))
+        perm_means = (signs @ diffs) / float(n)
+        perm_p = float((np.sum(np.abs(perm_means) >= abs(obs_diff) - 1e-12) + 1) / (n_permutations + 1))
+
+    non_zero = diffs[np.abs(diffs) > 1e-12]
+    if len(non_zero) < 2:
+        wilcox_p = 1.0 if len(non_zero) == 0 else 0.5
+    else:
+        try:
+            wilcox_p = float(wilcoxon(non_zero, alternative="two-sided").pvalue)
+        except Exception:
+            wilcox_p = perm_p
+
+    return {
+        "mean_a": round(float(np.mean(sa)), 4),
+        "mean_b": round(float(np.mean(sb)), 4),
+        "mean_diff": round(obs_diff, 4),
+        "ci95_low": round(ci["ci_low"], 4),
+        "ci95_high": round(ci["ci_high"], 4),
+        "permutation_p_value": round(min(1.0, perm_p), 8),
+        "wilcoxon_p_value": round(min(1.0, wilcox_p), 8),
+    }
+
+
+def holm_bonferroni_correction(
+    p_values: dict[str, float],
+    alpha: float = 0.05,
+) -> dict[str, dict[str, float | bool]]:
+    """Step-down Holm-Bonferroni family-wise error rate correction over named hypothesis tests."""
+    m = len(p_values)
+    if m == 0:
+        return {}
+    ordered = sorted(p_values.items(), key=lambda kv: float(kv[1]))
+    adjusted_map: dict[str, dict[str, float | bool]] = {}
+    running_max = 0.0
+    still_rejecting = True
+    for rank_idx, (name, raw_p) in enumerate(ordered):
+        mult = m - rank_idx
+        adj_p = min(1.0, max(running_max, float(raw_p) * mult))
+        running_max = adj_p
+        if adj_p > alpha:
+            still_rejecting = False
+        adjusted_map[name] = {
+            "raw_p_value": round(float(raw_p), 8),
+            "holm_adjusted_p_value": round(adj_p, 8),
+            "significant_at_alpha": bool(still_rejecting),
+        }
+    return {k: adjusted_map[k] for k in p_values}
+
+
 def bootstrap_ci(
     values_a: Sequence[Any],
     metric_fn: Callable[[np.ndarray, np.ndarray], float] | None = None,
@@ -126,6 +283,7 @@ def compute_when2speak_metrics(
     episodes: Sequence[EpisodeResult],
     n_bootstrap: int = 1000,
     seed: int = 42,
+    calibrated_probs: Sequence[float] | None = None,
 ) -> dict[str, Any]:
     """Compute full When2Speak metric suite (Macro F1, SPEAK F1/P/R, FIR, MIR, AUROC, AUPRC, ECE, Token Reduction)."""
     if len(y_true) != len(episodes):
@@ -136,7 +294,11 @@ def compute_when2speak_metrics(
     yt = np.asarray([int(bool(y)) for y in y_true], dtype=int)
     yp = np.asarray([int(bool(ep.gate.binary_speak)) for ep in episodes], dtype=int)
     margins = np.asarray([float(ep.gate.margin_delta) for ep in episodes], dtype=float)
-    probs = _sigmoid(margins * 3.0)
+    probs = (
+        np.clip(np.asarray(calibrated_probs, dtype=float), 0.0, 1.0)
+        if calibrated_probs is not None
+        else _sigmoid(margins * 3.0)
+    )
 
     tp = int(np.sum((yt == 1) & (yp == 1)))
     tn = int(np.sum((yt == 0) & (yp == 0)))
@@ -169,7 +331,11 @@ def compute_when2speak_metrics(
     slate_tok = sum(ep.prompt_tokens_slate for ep in episodes)
     token_reduction = (1.0 - (slate_tok / raw_tok)) if raw_tok > 0 else 0.0
     short_circuit_rate = sum(1 for ep in episodes if ep.gate.short_circuited) / len(episodes)
-    total_cost = sum(ep.total_cost_usd for ep in episodes)
+    billed_cost = sum(ep.total_cost_usd for ep in episodes)
+    total_cost = sum(
+        (ep.uncached_cost_usd if getattr(ep, "uncached_cost_usd", 0.0) > 0.0 else ep.total_cost_usd)
+        for ep in episodes
+    )
 
     macro_ci = bootstrap_ci(
         yt,
@@ -196,10 +362,12 @@ def compute_when2speak_metrics(
         "auroc": round(auroc, 6),
         "auprc": round(auprc, 6),
         "ece": round(ece, 6),
+        "ece_is_platt_calibrated": calibrated_probs is not None,
         "margin_gap": round(margin_gap, 6),
         "token_reduction_pct": round(token_reduction * 100.0, 2),
         "short_circuit_rate": round(short_circuit_rate, 4),
         "total_cost_usd": round(total_cost, 6),
+        "billed_cost_usd": round(billed_cost, 6),
         "cost_per_1k_turns_usd": round(total_cost * 1000.0 / len(episodes), 4),
     }
 
@@ -283,7 +451,11 @@ def compute_pagemantle_metrics(
     token_red = (1.0 - (slate_tok / raw_tok)) if raw_tok > 0 else 0.0
     timeout_rate = sum(1 for ep in episodes if ep.timed_out) / max(1, n)
     avg_tools = sum(ep.tool_calls_used for ep in episodes) / max(1, n)
-    total_cost = sum(ep.total_cost_usd for ep in episodes)
+    billed_cost = sum(ep.total_cost_usd for ep in episodes)
+    total_cost = sum(
+        (ep.uncached_cost_usd if getattr(ep, "uncached_cost_usd", 0.0) > 0.0 else ep.total_cost_usd)
+        for ep in episodes
+    )
 
     overall_scores = rubric_axes["overall_score"]
     overall_ci = (
@@ -316,6 +488,7 @@ def compute_pagemantle_metrics(
         "avg_tool_calls": round(avg_tools, 2),
         "token_reduction_pct": round(token_red * 100.0, 2),
         "total_cost_usd": round(total_cost, 6),
+        "billed_cost_usd": round(billed_cost, 6),
         "cost_per_task_usd": round(total_cost / max(1, n), 6),
         "per_category_overall": {
             cat: round(float(np.mean(vals)), 4) for cat, vals in sorted(by_category.items())

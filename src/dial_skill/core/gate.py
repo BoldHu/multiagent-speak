@@ -13,6 +13,7 @@ from dial_skill.prompts.templates import (
     SINGLE_COMBINED_GATE_JSON_SCHEMA,
     SKEPTIC_JSON_SCHEMA,
     build_advocate_messages,
+    build_deliberative_skeptic_messages,
     build_single_combined_messages,
     build_skeptic_messages,
 )
@@ -241,6 +242,7 @@ class DialecticGate:
         self.gate_model = gate_model
         self.cfg = cfg
         self.seed = seed
+        self.last_uncached_cost_usd: float = 0.0
 
     async def _run_advocate(self, slate: SharedEvidenceSlate) -> tuple[AdvocateOutput, LLMCallResult]:
         res = await self.openai_client.complete_json(
@@ -269,6 +271,43 @@ class DialecticGate:
             messages=build_skeptic_messages(slate.canonical_text, env_mode=slate.env_mode),
             json_schema=SKEPTIC_JSON_SCHEMA,
             schema_name="dial_skill_skeptic",
+            temperature=self.cfg.gate.temperature,
+            seed=self.seed,
+        )
+        data = dict(res.parsed_json or {})
+        raw_vetos = data.get("matched_veto_conditions", [])
+        raw_cites = data.get("cited_evidence_ids", [])
+        out = SkepticOutput(
+            slate_hash=slate.slate_hash,
+            skeptic_score=_clamp01(data.get("skeptic_score", 0.0)),
+            disruption_risk=str(data.get("disruption_risk", "")),
+            matched_veto_conditions=[str(x) for x in raw_vetos] if isinstance(raw_vetos, list) else [],
+            max_acceptable_channel=_normalize_tier(data.get("max_acceptable_channel", "SILENT")),
+            cited_evidence_ids=[str(x) for x in raw_cites] if isinstance(raw_cites, list) else [],
+        )
+        return out, res
+
+    async def _run_deliberative_skeptic(
+        self,
+        slate: SharedEvidenceSlate,
+        advocate_out: AdvocateOutput,
+    ) -> tuple[SkepticOutput, LLMCallResult]:
+        proposal = {
+            "advocate_score": advocate_out.advocate_score,
+            "recommended_skill": advocate_out.recommended_skill,
+            "minimum_effective_channel": advocate_out.minimum_effective_channel,
+            "unmitigated_loss": advocate_out.unmitigated_loss,
+            "cited_evidence_ids": advocate_out.cited_evidence_ids,
+        }
+        res = await self.openai_client.complete_json(
+            model=self.gate_model,
+            messages=build_deliberative_skeptic_messages(
+                slate.canonical_text,
+                advocate_proposal=proposal,
+                env_mode=slate.env_mode,
+            ),
+            json_schema=SKEPTIC_JSON_SCHEMA,
+            schema_name="dial_skill_deliberative_skeptic",
             temperature=self.cfg.gate.temperature,
             seed=self.seed,
         )
@@ -339,6 +378,7 @@ class DialecticGate:
 
         mode = self.cfg.ablation.gate_mode
         cost = 0.0
+        uncached_cost = 0.0
         elapsed = 0.0
         adv_out: AdvocateOutput | None = None
         skep_out: SkepticOutput | None = None
@@ -350,21 +390,54 @@ class DialecticGate:
                 self._run_skeptic(skeptic_slate),
             )
             cost = adv_res.cost_usd + skep_res.cost_usd
+            uncached_cost = adv_res.uncached_cost_usd + skep_res.uncached_cost_usd
             elapsed = max(adv_res.elapsed_sec, skep_res.elapsed_sec)
+        elif mode == "deliberative_collab":
+            # Closed-loop collaborative deliberation:
+            # 1) Advocate proposes concrete intervention thesis;
+            # 2) If Advocate finds meaningful need (>= deliberative_rebuttal_min_adv),
+            #    Skeptic directly cross-examines Advocate's thesis on the shared slate.
+            adv_out, adv_res = await self._run_advocate(advocate_slate)
+            cost = adv_res.cost_usd
+            uncached_cost = adv_res.uncached_cost_usd
+            elapsed = adv_res.elapsed_sec
+            rebuttal_floor = min(
+                float(self.cfg.gate.deliberative_rebuttal_min_adv),
+                float(self.cfg.gate.theta_floor),
+            )
+            if adv_out.advocate_score < rebuttal_floor:
+                skep_out = SkepticOutput(
+                    slate_hash=skeptic_slate.slate_hash,
+                    skeptic_score=round(_clamp01(1.0 - adv_out.advocate_score), 6),
+                    disruption_risk="Advocate found no actionable unmet need; skipping rebuttal.",
+                    matched_veto_conditions=["advocate_low_need_consensus"],
+                    max_acceptable_channel=InterventionTier.SILENT,
+                    cited_evidence_ids=list(adv_out.cited_evidence_ids),
+                )
+            else:
+                skep_out, skep_res = await self._run_deliberative_skeptic(skeptic_slate, adv_out)
+                cost += skep_res.cost_usd
+                uncached_cost += skep_res.uncached_cost_usd
+                elapsed += skep_res.elapsed_sec
         elif mode == "advocate_only":
             adv_out, adv_res = await self._run_advocate(advocate_slate)
             cost = adv_res.cost_usd
+            uncached_cost = adv_res.uncached_cost_usd
             elapsed = adv_res.elapsed_sec
         elif mode == "skeptic_only":
             skep_out, skep_res = await self._run_skeptic(skeptic_slate)
             cost = skep_res.cost_usd
+            uncached_cost = skep_res.uncached_cost_usd
             elapsed = skep_res.elapsed_sec
         elif mode == "single_combined":
             adv_out, skep_out, comb_res = await self._run_single_combined(advocate_slate)
             cost = comb_res.cost_usd
+            uncached_cost = comb_res.uncached_cost_usd
             elapsed = comb_res.elapsed_sec
         else:
             raise ValueError(f"Unsupported gate_mode: {mode}")
+
+        self.last_uncached_cost_usd = uncached_cost
 
         decision = compute_gate_decision(
             slate=advocate_slate,

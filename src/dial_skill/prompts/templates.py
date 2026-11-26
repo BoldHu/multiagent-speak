@@ -105,7 +105,7 @@ Rules:
 1. Ground your evaluation STRICTLY in the Shared Evidence Slate and cite exact msg_id items.
 2. Respect multi-party turn-taking & temporal depth (`turns=` and `speakers=` in the header):
    - OPENING / VERY EARLY FLOOR (`turns <= 2` or `speakers <= 1`, unless `[AGENT]` is explicitly named): Humans have NOT yet had a chance to respond to each other! Even if `Speaker_0` asks `"Hey everyone, can someone help / does anyone know...?"`, the AI MUST let humans speak first -> score `0.05 - 0.20`.
-   - EARLY ACTIVE HUMAN FLOW (`turns = 3..4`, unless `[AGENT]` is explicitly named): Humans are just starting to share ideas/suggestions -> keep `advocate_score <= 0.35` unless there is a clear factual error needing urgent correction.
+   - EARLY ACTIVE HUMAN FLOW (`turns = 3..4`, unless `[AGENT]` is explicitly named): Prefer letting human back-and-forth develop (`0.15 - 0.40`) when humans are smoothly answering each other, BUT score `0.65 - 0.90` if there is already a clear unanswered factual question, misconception, or concrete synthesis gap where brief assistance helps immediately.
    - DIRECT `[AGENT]` REQUEST vs. PASSIVE ACKNOWLEDGMENT:
      * If the latest turn explicitly asks `[AGENT]` a **new unanswered question** or requests `[AGENT]` to explain/check/recommend something -> score `0.80 - 0.95`.
      * If `[AGENT]` already spoke earlier (`agent_turns >= 1`) and the latest turn is merely **thanking or agreeing with `[AGENT]`** (`"Thanks [AGENT]"`, `"That makes sense [AGENT]"`, `"[AGENT] makes a good point"`) with **NO new question** -> do NOT double-text; score `0.05 - 0.20`!
@@ -126,7 +126,7 @@ Rules:
 1. Ground your evaluation STRICTLY in the Shared Evidence Slate and cite exact msg_id items.
 2. Score `skeptic_score` in [0.00, 1.00] using the FULL calibrated range:
    - **0.85 - 0.98 (`SILENT`) — Opening / Early-Floor Restraint**: Whenever `turns <= 2` (especially `turns == 1` opening post!) or `speakers <= 1` AND `[AGENT]` is NOT explicitly named, score `>= 0.85` and `max_acceptable_channel = SILENT` — EVEN IF `Speaker_0` asks `"Hey everyone, can anyone help?"`, because the AI must give human participants space to reply first!
-   - **0.65 - 0.84 (`SILENT`) — Active Early Human Back-and-Forth**: When `turns = 3..4` and humans are actively offering suggestions to each other without naming `[AGENT]` or stalling, wait for human dialogue to mature.
+   - **0.60 - 0.82 (`SILENT`) — Active Early Human Back-and-Forth**: When `turns = 3..4` and humans are actively answering each other smoothly without naming `[AGENT]` or hitting an unresolved question/misconception, let human dialogue continue; however, if a concrete factual gap or unanswered question is already on the table at `turns = 3..4`, score `0.15 - 0.35` so timely help is not suppressed.
    - **0.05 - 0.25 (`THREAD_BRIEF` or `CHANNEL_INTERVENE`) — Low Disruption Risk**:
      * Latest turn explicitly asks `[AGENT]` a **new unanswered question or request** (NOT merely thanking or praising `[AGENT]`'s earlier comment!).
      * Mature discussion (`turns >= 6`, multi-speaker) where the latest turn reaches a clear synthesis moment, open conceptual puzzle, competing viewpoints, unresolved practical tactic, or explicit uncertainty where a concise `[AGENT]` contribution (**Synthesis & Reframing**, **Data Provision**, **Source Identification**, **Concept Definition**, or **Factual Correction**) naturally enriches the thread.
@@ -300,6 +300,130 @@ def build_single_combined_messages(
     ]
 
 
+DELIBERATIVE_SKEPTIC_CROSS_EXAM_PROMPT = """You are the SKEPTIC cross-examiner in a closed-loop multi-agent proactive workplace gate.
+You receive:
+1. The exact Shared Evidence Slate (dialogue + `[Recon]` verified company records + candidate Skill `Vetos`), and
+2. The ADVOCATE agent's concrete intervention proposal (`advocate_score`, `recommended_skill`, `minimum_effective_channel`, `unmitigated_loss`, and `cited_evidence_ids`).
+
+Your job is NOT blind contrarianism; it is rigorous cross-examination of the Advocate's thesis:
+- Check whether the Advocate's claimed `unmitigated_loss` is genuinely unresolved in the Slate, OR whether `[Evidence]` / `[Recon]` shows a teammate already answered/owned it, deferred it, or is brainstorming casually (`skeptic_score = 0.75 - 1.00`, `max_acceptable_channel = SILENT`).
+- Check whether the Advocate's `minimum_effective_channel` is overly public or disruptive given privacy/scope boundaries; if help is warranted (`skeptic_score = 0.05 - 0.35`), cap `max_acceptable_channel` to the least-intrusive effective scope (`DM_NUDGE`, `THREAD_BRIEF`, or `CHANNEL_INTERVENE`).
+- If the Advocate identified a real, unaddressed factual discrepancy, unanswered request, coordination gap, or policy boundary backed by `[Evidence]`/`[Recon]` with NO matching Veto, endorse intervention with low `skeptic_score` (`0.05 - 0.25`).
+Return strict JSON matching the Skeptic schema."""
+
+WHEN2SPEAK_DELIBERATIVE_SKEPTIC_CROSS_EXAM_PROMPT = """You are the SKEPTIC cross-examiner in a closed-loop multi-agent group-chat turn-taking gate (`[AGENT]`).
+You receive BOTH the Shared Evidence Slate (with `turns=`, `speakers=`, `agent_turns=`, `latest=`) AND the ADVOCATE agent's specific argument for why `[AGENT]` should speak right now.
+
+Cross-examine the Advocate's thesis directly against the conversation state:
+- **Refute (`skeptic_score = 0.75 - 0.98`, `SILENT`)** if:
+  (a) `turns <= 2` or `speakers <= 1` without `[AGENT]` being named (humans must get the floor first, even on open questions!),
+  (b) `[AGENT]` already spoke (`agent_turns >= 1`) and the latest turn is merely thanking/agreeing with `[AGENT]` without asking anything new,
+  (c) humans are actively bantering, handling personal logistics, or already answered the point cleanly, so Advocate's proposed reply would be redundant or intrusive.
+- **Cautious Middle (`skeptic_score = 0.35 - 0.65`)** if the discussion is mid-flow where a brief contribution is optional rather than clearly needed.
+- **Endorse (`skeptic_score = 0.05 - 0.25`, `THREAD_BRIEF` or `CHANNEL_INTERVENE`)** if the Advocate's thesis points to a genuine direct question to `[AGENT]`, an unresolved factual/conceptual gap, or a mature multi-speaker synthesis moment where concise `[AGENT]` input clearly elevates the conversation.
+Return strict JSON matching the Skeptic schema."""
+
+
+def build_deliberative_skeptic_messages(
+    canonical_slate_text: str,
+    advocate_proposal: dict[str, Any],
+    env_mode: str = "pagemantle",
+) -> list[dict[str, str]]:
+    sys_prompt = (
+        WHEN2SPEAK_DELIBERATIVE_SKEPTIC_CROSS_EXAM_PROMPT
+        if env_mode == "when2speak"
+        else DELIBERATIVE_SKEPTIC_CROSS_EXAM_PROMPT
+    )
+    proposal_block = (
+        "ADVOCATE INTERVENTION THESIS TO CROSS-EXAMINE:\n"
+        f"- advocate_score: {advocate_proposal.get('advocate_score', 0.0):.2f}\n"
+        f"- recommended_skill: {advocate_proposal.get('recommended_skill', 'none')}\n"
+        f"- proposed_channel: {advocate_proposal.get('minimum_effective_channel', 'THREAD_BRIEF')}\n"
+        f"- claimed_unmitigated_loss: {advocate_proposal.get('unmitigated_loss', '')}\n"
+        f"- cited_evidence_ids: {advocate_proposal.get('cited_evidence_ids', [])}"
+    )
+    return [
+        {"role": "system", "content": sys_prompt},
+        {
+            "role": "user",
+            "content": f"{canonical_slate_text}\n\n{proposal_block}",
+        },
+    ]
+
+
+WHEN2SPEAK_EXECUTION_SYSTEM_PROMPT = """You are `[AGENT]`, a thoughtful, concise AI participant in a multi-party human group conversation.
+The turn-taking gate determined that speaking right now adds concrete value.
+Write a natural, direct, socially attuned reply to the group chat:
+1. Match the natural conversational register of a smart human-aligned participant—NEVER use corporate bot headers (`**Heads-up:**`, `**Suggested Action:**`), meta-commentary, or robotic greetings (`"Hello everyone! As an AI..."`).
+2. Keep it crisp and high-signal (typically 1-3 sentences, max 65 words): directly answer the open question, clarify the concept/misconception, or synthesize the competing viewpoints concisely.
+3. Do NOT repeat points humans just made; build on them cleanly and leave room for humans to continue.
+4. Only if deeper inspection shows speaking right now would be completely redundant (e.g., purely echoing a human's exact answer), output exact JSON `{"abort_to_silent": true, "reason": "..."}`."""
+
+
+STAGE3_AUDITOR_SYSTEM_PROMPT = """You are the PRE-DELIVERY SKEPTIC-AUDITOR in a closed-loop multi-agent workplace assistant.
+Before the Executor's drafted message is delivered to teammates, audit it strictly against the Conversation Slate and Verified Tool Observations:
+1. **VETO_TO_SILENT**: Choose this ONLY if verified tool records or conversation turns prove the issue is ALREADY resolved/owned/deferred with zero remaining unmet need, so sending any message would be a false interruption.
+2. **REVISE**: Choose this if an intervention IS warranted, but the draft has ANY quality flaw:
+   - cites an unverified number/ID/status or misses an important qualifier/caveat shown in tool observations;
+   - fails to separate safe aggregate answers from restricted individual records on a mixed-intent question (never leak restricted PII, and never refuse the safe aggregate part);
+   - is wordy, preachy, repetitive, or poorly scoped for the target channel/tier.
+   Provide the corrected, concise, 100%-evidence-grounded `revised_response` directly!
+3. **APPROVE**: Choose this when the draft is accurate, grounded in retrieved evidence, concise, and appropriately scoped. Leave `revised_response` empty.
+Return strict JSON matching the schema."""
+
+WHEN2SPEAK_STAGE3_AUDITOR_SYSTEM_PROMPT = """You are the PRE-DELIVERY SKEPTIC-AUDITOR for `[AGENT]` in a multi-party group chat.
+Audit the Executor's candidate reply before it is posted to the conversation:
+1. **VETO_TO_SILENT**: Choose ONLY if the candidate reply merely repeats what a human already said or replies to a pure `"Thanks [AGENT]"` acknowledgment with zero new content.
+2. **REVISE**: Choose if speaking IS helpful, but the draft is too long (>65 words), uses stiff bulleted/robotic formatting (`**Heads-up:**`, `"Great question!"`), lectures the group, or misses the core point of the latest turns. Rewrite it in `revised_response` into a crisp, natural, high-value 1-3 sentence group-chat contribution.
+3. **APPROVE**: Choose when the draft is already natural, concise, accurate, and socially well-calibrated. Leave `revised_response` empty.
+Return strict JSON matching the schema."""
+
+STAGE3_AUDITOR_JSON_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["audit_verdict", "critique", "revised_response"],
+    "properties": {
+        "audit_verdict": {
+            "type": "string",
+            "enum": ["APPROVE", "REVISE", "VETO_TO_SILENT"],
+        },
+        "critique": {"type": "string", "maxLength": 240},
+        "revised_response": {"type": "string", "maxLength": 1200},
+    },
+}
+
+
+def build_stage3_auditor_messages(
+    *,
+    canonical_slate_text: str,
+    candidate_draft: str,
+    final_tier: InterventionTier,
+    selected_skill: str,
+    tool_evidence_text: str = "",
+    env_mode: str = "pagemantle",
+) -> list[dict[str, str]]:
+    sys_prompt = (
+        WHEN2SPEAK_STAGE3_AUDITOR_SYSTEM_PROMPT
+        if env_mode == "when2speak"
+        else STAGE3_AUDITOR_SYSTEM_PROMPT
+    )
+    ev_section = (
+        f"\n\nVerified Tool Observations:\n{tool_evidence_text}"
+        if tool_evidence_text
+        else ""
+    )
+    user_content = (
+        f"Shared Evidence Slate:\n{canonical_slate_text}"
+        f"{ev_section}\n\n"
+        f"Target Skill: `{selected_skill}` | Target Channel Tier: `{final_tier.value}`\n"
+        f"Candidate Draft Response to Audit:\n{candidate_draft}"
+    )
+    return [
+        {"role": "system", "content": sys_prompt},
+        {"role": "user", "content": user_content},
+    ]
+
+
 # ---------------------------------------------------------------------------
 # P3-B. Stage 3 — Channel-Shaped Response Execution Prompt
 # ---------------------------------------------------------------------------
@@ -452,6 +576,7 @@ SINGLE_GATE_JSON_SCHEMA: dict[str, Any] = {
 PROACT_SYSTEM_PROMPT = """You are a breakdown-aware proactive collaboration agent (ProACT).
 Analyze the speaker-attributed conversation history to determine whether a collaboration breakdown has occurred:
 {disagreement, ambiguous_goal, forgotten_constraint, underspecified_plan, discussion_loop, imbalanced_participation, factual_gap, none}.
+Also report calibrated `intervention_confidence` in [0.00, 1.00] indicating how strongly an intervention is warranted right now.
 Output strict JSON matching the schema."""
 
 PROACT_JSON_SCHEMA: dict[str, Any] = {
@@ -461,6 +586,7 @@ PROACT_JSON_SCHEMA: dict[str, Any] = {
         "breakdown_detected",
         "breakdown_type",
         "should_intervene",
+        "intervention_confidence",
         "target_skill",
         "rationale",
     ],
@@ -480,6 +606,7 @@ PROACT_JSON_SCHEMA: dict[str, Any] = {
             ],
         },
         "should_intervene": {"type": "boolean"},
+        "intervention_confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
         "target_skill": {"type": "string", "enum": ALL_SKILL_ENUM},
         "rationale": {"type": "string", "maxLength": 240},
     },

@@ -1,45 +1,42 @@
-# DIAL-Skill (`when2speak`)
+# DIAL-Collab (`when2speak`)
 
-**Decision-Informed Adversarial-Margin Gating with Online Dual-Boundary Skill Evolution** for proactive enterprise agents across **When2Speak** (`duke-trust-lab/When2Speak`) and **Deepnote Agent Initiative Benchmark / PageMantle-Ext** (`deepnote/agent-initiative-benchmark` + `deepnote/pagemantle-company-dataset`).
+**Closed-Loop Multi-Agent Collaboration for Proactive Turn-Taking ("When to Speak") and Verified Utterance Synthesis ("How to Speak")** across **When2Speak** (`duke-trust-lab/When2Speak`), **Deepnote Agent Initiative Benchmark (`Official-8`)**, and **`PageMantle-Hard`** (`deepnote/agent-initiative-benchmark` + `deepnote/pagemantle-company-dataset`).
 
-## Architecture Highlights
+## Architecture Overview
 
-1. **Stage 1 — System-1 Decision-Change Triage & Symmetric Shared Evidence Slate (SSES)**:
-   - TypeSafe Jev (`jev-latest`, with automatic `OpenAILunaTriageFallback`) scores each turn's decision-change VoI, stance, skill hint, and urgency.
-   - Balanced retention of both `need_signal` and `defer_or_resolved_signal` / `scope_risk_signal` turns compiles a canonical `SharedEvidenceSlate` verified by SHA-256 `slate_hash`.
-2. **Stage 1.5 — Bounded Read-Only Silent Recon (PageMantle Mode)**:
-   - Up to 3 read-only enterprise tool lookups inject verified source-of-truth facts into the shared slate before gating.
-3. **Stage 2 — Symmetric-Evidence Dialectic Gating & 4-Tier Dynamic De-escalation**:
-   - Parallel independent **Advocate** and **Skeptic** evaluators inspect the bit-for-bit identical slate (`advocate.slate_hash == skeptic.slate_hash`).
-   - Differential margin $\Delta_t = S_{\text{adv}} - \lambda S_{\text{skep}} - \delta_{k^*}$ and epistemic disagreement $U_t = \min(S_{\text{adv}}, S_{\text{skep}})$ map onto `SILENT` / `DM_NUDGE` / `THREAD_BRIEF` / `CHANNEL_INTERVENE`.
-4. **Stage 3 — Applicability-Routed Skill Execution**:
-   - 8 Deepnote-derived Dual-Boundary Skill Cards (`find`, `explain`, `analyze`, `check`, `diagnose`, `decide`, `coordinate`, `guard`) with bounded tool budgets and Deepnote 180s model-time tracking.
-5. **Stage 4 — Online Dual-Boundary Counterfactual Skill Evolution (`DB-CSE`)**:
-   - Zero weight updates. Bounded numeric updates $(\delta_k, \gamma_k)$ + generalized atomic boundary patches verified by a Counterfactual Replay `EscrowGate` (0 anchor regressions) under a strict $O(1)$ prompt cap.
+1. **Stage 1 — System-1 Decision-Change Triage & Thread-Isolated Shared Evidence Slate**:
+   - TypeSafe Jev (`jev-latest`, with structured `OpenAILunaTriageFallback`) scores each turn's decision-change Value of Information (VoI), stance, skill prior, and urgency.
+   - On multi-channel enterprise snapshots (`Official-8`, `PageMantle-Hard`), snapshots are decomposed by `(channel_id, root_ts)` so already-settled decoy threads do not contaminate active threads.
+2. **Stage 1.5 — Bounded Read-Only Silent Recon (Enterprise Mode)**:
+   - Executes bounded read-only cross-service lookups across company records before gating so downstream agents reason over verified facts rather than chat surface cues alone.
+3. **Stage 2 — Closed-Loop Deliberative Gating (`deliberative_collab`)**:
+   - **Advocate** proposes a concrete intervention thesis (`advocate_score`, `recommended_skill`, `minimum_effective_channel`, `unmitigated_loss`, `cited_evidence_ids`).
+   - On non-trivial cases (`advocate_score >= deliberative_rebuttal_min_adv`), **Skeptic** directly **cross-examines** the Advocate's thesis against the shared evidence slate and candidate Skill `veto_conditions`.
+   - Validation-calibrated margin thresholds (`calibrate_when2speak_thresholds` / `calibrate_1d_score_threshold`) and leak-free **Platt scaling** (`calibrate_platt_from_validation`) map scores to calibrated probabilities and intervention tiers (`SILENT`, `DM_NUDGE`, `THREAD_BRIEF`, `CHANNEL_INTERVENE`) with zero test-set leakage.
+4. **Stage 3 — Applicability-Routed Execution + Pre-Delivery Skeptic-Auditor (`Draft -> Audit -> Refine`)**:
+   - **Executor** synthesizes a response (or stages candidate Slack writes in a staging buffer after tool verification).
+   - **Pre-Delivery Skeptic-Auditor** audits the draft against conversation history, retrieved tool observations, conciseness, and least-privilege disclosure policy (`APPROVE`, `REVISE` max 1 round, or `VETO_TO_SILENT`), consolidating duplicate writes to prevent multi-message spam.
+5. **Secondary Extension — Bounded Online Skill Adaptation (`DB-CSE`)**:
+   - Optional training-free online adaptation updating bounded per-skill offsets and escrow-verified symbolic boundary predicates (`max_rules_per_side = 5`).
 
-## Quickstart (Local & Google Colab)
+## Self-Contained Google Colab Experiment Suite
+
+All notebooks include self-contained environment setup cells (`Google Drive` mount, `git clone/pull`, `pip install`, secret bootstrap, SQLite API cache reuse, and atomic JSONL `--resume`):
+
+- **Primary Publication Notebooks (Clean V3 Suite)**:
+  - `notebooks/10_when2speak_collab_and_utterance_quality.ipynb`: Equal validation-calibrated When2Speak timing (`2,000` turns, Platt ECE, `Direct-SC@3`, `ProACT`, `A4` ablations, cross-family backbones, paired bootstrap + Holm-Bonferroni) **and** Utterance Quality (`100` stratified gold `SPEAK` turns graded by cross-family Dual-Judge).
+  - `notebooks/11_official_deepnote_8_clean_multiseed.ipynb`: Zero-contamination programmatic check + 5-way controlled evaluation (`Direct`, `Prompt-Matched Direct`, `Flat v1`, `w/o Stage-3 Audit`, `DIAL-Collab Full`) × `3` seeds × `gpt-4.1-mini` / `gpt-4.1` / `gpt-5.6-terra` on Deepnote `Official-8`.
+  - `notebooks/12_pagemantle_hard_v3_ablations_and_dbcse.ipynb`: 32 held-out multi-channel `PageMantle-Hard` tasks across 3 backbones + `Prompt-Matched Direct` + `Stage-3 Audit` ablation + secondary `DB-CSE` vs `Reflexion` held-out comparison.
+- **Setup, Diagnostics & Legacy Audit Notebooks**: `00`–`09` (note: `PageMantle-Ext` in `01`/`04` serves strictly as a DB-grounded synthetic sanity check; `Official-8` and `PageMantle-Hard` are the primary enterprise benchmarks).
+
+## Local Verification (Zero API Cost)
 
 ```bash
-# 1. Install in editable mode
 pip install -e ".[dev]"
-
-# 2. Run offline unit tests (zero API cost)
-pytest -v
-
-# 3. Validate all Colab notebooks
+pytest -q
 python -m scripts.validate_notebooks
-
-# 4. Run live API preflight (< $0.01)
-python -m dial_skill.llm.preflight
-
-# 5. Run end-to-end Pilot Verification
-python -m dial_skill.eval.runners pilot --config configs/experiments.yaml
 ```
 
 ## Secret Safety
 
-API keys (`JEV_API_KEY.txt`, `OPENAI_KEY.txt`) are strictly excluded by `.gitignore`. Lookup order:
-1. Environment variables (`TYPESAFE_API_KEY` / `JEV_API_KEY`, `OPENAI_API_KEY`)
-2. Google Drive secrets folder (`/content/drive/MyDrive/when2speak_research/secrets/`)
-3. Colab `userdata` secrets
-4. Local workspace root (`./JEV_API_KEY.txt`, `./OPENAI_KEY.txt`)
+API keys (`JEV_API_KEY.txt`, `OPENAI_KEY.txt`, `AUTODL_KEY.txt`) and `local_drive_mirror/` are excluded by `.gitignore` and never printed in logs or notebooks.

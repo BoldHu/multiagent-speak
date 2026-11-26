@@ -41,6 +41,7 @@ class ProACTBaseline:
         gate_model: str,
         executor_model: str | None = None,
         static_skill_store: SkillStore | None = None,
+        threshold: float = 0.50,
         max_tool_calls: int = 7,
         hard_time_cap_sec: float = 180.0,
         soft_time_cap_sec: float = 90.0,
@@ -52,6 +53,7 @@ class ProACTBaseline:
         self.gate_model = gate_model
         self.executor_model = executor_model or gate_model
         self.static_skill_store = static_skill_store or SkillStore.from_json_file()
+        self.threshold = threshold
         self.max_tool_calls = max_tool_calls
         self.hard_time_cap_sec = hard_time_cap_sec
         self.soft_time_cap_sec = soft_time_cap_sec
@@ -66,7 +68,12 @@ class ProACTBaseline:
         conversation_id: str,
         channel_name: str,
         messages: list[ChatMessage],
-        benchmark: Literal["when2speak", "pagemantle_official", "pagemantle_ext"],
+        benchmark: Literal[
+            "when2speak",
+            "pagemantle_official",
+            "pagemantle_ext",
+            "pagemantle_synthetic_sanity",
+        ],
         tool_env: ToolEnvironment | None = None,
         generate_text: bool = True,
     ) -> EpisodeResult:
@@ -86,12 +93,20 @@ class ProACTBaseline:
             seed=self.seed,
         )
         cost = res.cost_usd
+        uncached_cost = res.uncached_cost_usd
         model_elapsed = res.elapsed_sec
         data = res.parsed_json or {}
 
         breakdown_detected = bool(data.get("breakdown_detected", False))
         breakdown_type = str(data.get("breakdown_type", "none"))
-        should_intervene = bool(data.get("should_intervene", False))
+        raw_should = bool(data.get("should_intervene", False))
+        raw_conf = data.get("intervention_confidence")
+        if raw_conf is not None:
+            conf = max(0.0, min(1.0, float(raw_conf)))
+            should_intervene = conf >= self.threshold
+        else:
+            conf = 0.85 if raw_should else 0.15
+            should_intervene = raw_should
         target_skill: SkillName = data.get("target_skill", "none")
         rationale = str(data.get("rationale", ""))
 
@@ -101,9 +116,9 @@ class ProACTBaseline:
             short_circuited=False,
             slate_hash=raw_hash,
             selected_skill=target_skill,
-            advocate_score=1.0 if should_intervene else 0.0,
-            skeptic_score=0.0 if should_intervene else 1.0,
-            margin_delta=0.5 if should_intervene else -0.5,
+            advocate_score=round(conf, 6),
+            skeptic_score=round(1.0 - conf, 6),
+            margin_delta=round(conf - self.threshold, 6),
             disagreement_u=0.0,
             raw_tier=final_tier,
             final_tier=final_tier,
@@ -156,6 +171,7 @@ class ProACTBaseline:
                 )
                 model_elapsed += llm_res.elapsed_sec
                 cost += llm_res.cost_usd
+                uncached_cost += llm_res.uncached_cost_usd
                 if model_elapsed > self.hard_time_cap_sec:
                     timed_out = True
                     response_text = llm_res.content.strip() or None
@@ -213,10 +229,12 @@ class ProACTBaseline:
             prompt_tokens_raw=raw_tokens,
             prompt_tokens_slate=raw_tokens,
             total_cost_usd=round(cost, 8),
+            uncached_cost_usd=round(max(cost, uncached_cost), 8),
             triage_backend_used="none",
             metadata={
                 "breakdown_detected": breakdown_detected,
                 "breakdown_type": breakdown_type,
+                "intervention_confidence": round(conf, 6),
                 "rationale": rationale,
             },
         )

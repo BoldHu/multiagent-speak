@@ -58,6 +58,27 @@ class DialSkillAgent:
             seed=seed,
         )
 
+    @staticmethod
+    def build_collab_config(
+        base_cfg: DialSkillConfig | None = None,
+        *,
+        enable_pre_delivery_audit: bool = True,
+        gate_mode: Literal[
+            "dual_margin",
+            "deliberative_collab",
+            "advocate_only",
+            "skeptic_only",
+            "single_combined",
+        ] = "deliberative_collab",
+    ) -> DialSkillConfig:
+        """Build closed-loop multi-agent collaboration config (Deliberative Gate + Stage-3 Draft-Audit-Refine)."""
+        cfg = (base_cfg or load_dial_skill_config()).model_copy(deep=True)
+        cfg.ablation.gate_mode = gate_mode
+        cfg.ablation.disable_disagreement_deesc = True
+        cfg.executor.enable_pre_delivery_audit = enable_pre_delivery_audit
+        cfg.ablation.disable_pre_delivery_audit = not enable_pre_delivery_audit
+        return cfg
+
     async def run_episode(
         self,
         *,
@@ -65,7 +86,12 @@ class DialSkillAgent:
         conversation_id: str,
         channel_name: str,
         messages: list[ChatMessage],
-        benchmark: Literal["when2speak", "pagemantle_official", "pagemantle_ext"],
+        benchmark: Literal[
+            "when2speak",
+            "pagemantle_official",
+            "pagemantle_ext",
+            "pagemantle_synthetic_sanity",
+        ],
         tool_env: ToolEnvironment | None = None,
         generate_text: bool = True,
         include_slate_in_metadata: bool = False,
@@ -74,6 +100,7 @@ class DialSkillAgent:
             "when2speak" if benchmark == "when2speak" else "pagemantle"
         )
         triage_cost_before = self.triage_client.total_cost_usd
+        triage_uncached_before = getattr(self.triage_client, "uncached_cost_usd", self.triage_client.total_cost_usd)
 
         # Stage 1: System-1 Decision-Change Triage & Balanced SSES
         triage_out = await self.triage_stage.run(
@@ -84,6 +111,11 @@ class DialSkillAgent:
             skill_store=self.skill_store,
         )
         triage_cost = max(0.0, self.triage_client.total_cost_usd - triage_cost_before)
+        triage_uncached = max(
+            triage_cost,
+            getattr(self.triage_client, "uncached_cost_usd", self.triage_client.total_cost_usd)
+            - triage_uncached_before,
+        )
 
         # Fast-silence short-circuit
         if triage_out.short_circuited:
@@ -116,6 +148,7 @@ class DialSkillAgent:
                 prompt_tokens_raw=triage_out.prompt_tokens_raw,
                 prompt_tokens_slate=triage_out.prompt_tokens_slate,
                 total_cost_usd=round(triage_cost, 8),
+                uncached_cost_usd=round(triage_uncached, 8),
                 triage_backend_used=triage_out.triage_backend_used,
                 metadata=meta,
             )
@@ -177,15 +210,26 @@ class DialSkillAgent:
             )
 
         total_cost = triage_cost + recon_res.cost_usd + gate_cost + exec_out.cost_usd
+        gate_uncached = max(gate_cost, getattr(self.gate_stage, "last_uncached_cost_usd", gate_cost))
+        total_uncached = (
+            triage_uncached
+            + max(recon_res.cost_usd, recon_res.uncached_cost_usd)
+            + gate_uncached
+            + max(exec_out.cost_usd, exec_out.uncached_cost_usd)
+        )
         total_tools = recon_res.tool_calls_used + exec_out.tool_calls_used
 
         meta = {
             "recon_calls": recon_res.tool_calls_used,
             "recon_snippets": [r.model_dump() for r in recon_res.snippets],
             "aborted_to_silent": exec_out.aborted_to_silent,
+            "audit_verdict": exec_out.audit_verdict,
+            "audit_critique": exec_out.audit_critique,
+            "gate_mode": self.cfg.ablation.gate_mode,
             "tool_trace": exec_out.tool_trace,
             "skill_store_version": self.skill_store.version,
             "triage_fallback_count": self.triage_client.fallback_count,
+            "billed_cost_usd": round(total_cost, 8),
         }
         if include_slate_in_metadata:
             meta["slate"] = slate.model_dump(mode="json")
@@ -205,6 +249,7 @@ class DialSkillAgent:
             prompt_tokens_raw=triage_out.prompt_tokens_raw,
             prompt_tokens_slate=triage_out.prompt_tokens_slate,
             total_cost_usd=round(total_cost, 8),
+            uncached_cost_usd=round(total_uncached, 8),
             triage_backend_used=triage_out.triage_backend_used,
             metadata=meta,
         )
