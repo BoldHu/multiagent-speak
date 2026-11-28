@@ -183,6 +183,63 @@ def test_numbered_openai_key_priority_and_quota_failfast(
     cache.close()
 
 
+def test_openai_strict_schema_sanitization_default_max_tokens_and_cache_compat(tmp_path: Path) -> None:
+    from dial_skill.prompts.templates import PROACT_JSON_SCHEMA
+
+    fake_oai = _FakeAsyncOpenAI(
+        [
+            json.dumps(
+                {
+                    "breakdown_detected": False,
+                    "breakdown_type": "none",
+                    "should_intervene": False,
+                    "intervention_confidence": 0.12,
+                    "target_skill": "none",
+                    "rationale": "Routine chat.",
+                }
+            )
+        ]
+    )
+    cache = SQLiteAPICache(tmp_path / "strict_cache.sqlite")
+    client = OpenAIClient(api_key="test-key", cache=cache, async_client=fake_oai)
+
+    res = asyncio.run(
+        client.complete_json(
+            model="gpt-4.1",
+            messages=[{"role": "user", "content": "hi"}],
+            json_schema=PROACT_JSON_SCHEMA,
+            schema_name="b2_proact_breakdown_gate",
+            temperature=0.0,
+            seed=42,
+        )
+    )
+    assert res.parsed_json is not None and res.parsed_json["breakdown_type"] == "none"
+    sent_kw = fake_oai.chat.completions.last_kwargs
+    # Default protective max_tokens=1536 applied to JSON calls without mutating cache key
+    assert sent_kw["max_tokens"] == 1536
+    sent_props = sent_kw["response_format"]["json_schema"]["schema"]["properties"]
+    assert "minimum" not in sent_props["intervention_confidence"]
+    assert "maximum" not in sent_props["intervention_confidence"]
+    assert "maxLength" not in sent_props["rationale"]
+    # Original schema dict untouched
+    assert "maxLength" in PROACT_JSON_SCHEMA["properties"]["rationale"]
+
+    # Cache hit works seamlessly with original cache_payload
+    res2 = asyncio.run(
+        client.complete_json(
+            model="gpt-4.1",
+            messages=[{"role": "user", "content": "hi"}],
+            json_schema=PROACT_JSON_SCHEMA,
+            schema_name="b2_proact_breakdown_gate",
+            temperature=0.0,
+            seed=42,
+        )
+    )
+    assert res2.from_cache is True
+    assert fake_oai.chat.completions.calls == 1
+    cache.close()
+
+
 def test_sqlite_cache_five_tuple_key_and_persistence(tmp_path: Path) -> None:
     db_path = tmp_path / "api_cache.sqlite"
     cache = SQLiteAPICache(db_path)

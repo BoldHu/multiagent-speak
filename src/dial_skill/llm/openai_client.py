@@ -134,6 +134,56 @@ def _uses_max_completion_tokens(model: str, provider_name: str) -> bool:
     return m.startswith(("gpt-5", "gpt-6", "o1", "o3", "o4"))
 
 
+_OPENAI_STRICT_UNSUPPORTED_SCHEMA_KEYS = frozenset(
+    {
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "minLength",
+        "maxLength",
+        "minItems",
+        "maxItems",
+        "pattern",
+        "format",
+    }
+)
+
+
+def _sanitize_openai_strict_schema(obj: Any) -> Any:
+    """Strip JSON Schema keywords rejected by OpenAI `strict: true` Structured Outputs without mutating caller schema."""
+    if isinstance(obj, dict):
+        return {
+            k: _sanitize_openai_strict_schema(v)
+            for k, v in obj.items()
+            if k not in _OPENAI_STRICT_UNSUPPORTED_SCHEMA_KEYS
+        }
+    if isinstance(obj, list):
+        return [_sanitize_openai_strict_schema(item) for item in obj]
+    return obj
+
+
+def _prepare_outgoing_response_format(
+    response_format: dict[str, Any] | None,
+    provider_name: str,
+) -> dict[str, Any] | None:
+    if response_format is None:
+        return None
+    if provider_name != "openai" and response_format.get("type") == "json_schema":
+        return {"type": "json_object"}
+    if provider_name == "openai" and response_format.get("type") == "json_schema":
+        js = response_format.get("json_schema")
+        if isinstance(js, dict) and "schema" in js:
+            return {
+                **response_format,
+                "json_schema": {
+                    **js,
+                    "schema": _sanitize_openai_strict_schema(js["schema"]),
+                },
+            }
+    return response_format
+
+
 class OpenAIClient:
     """Async OpenAI (and OpenAI-compatible gateway) wrapper enforcing caching, retries, concurrency, and USD tracking."""
 
@@ -186,6 +236,13 @@ class OpenAIClient:
         )
         return True
 
+    def _effective_timeout_sec(self) -> float:
+        return (
+            float(self._timeout_sec)
+            if self._timeout_sec is not None
+            else float(self.models_cfg.openai.timeout_sec)
+        )
+
     def _get_client(self) -> Any:
         if self._client is None:
             if not self._api_key:
@@ -193,14 +250,12 @@ class OpenAIClient:
                     f"API key not found for provider '{self.provider_name}'. "
                     "Set the corresponding env var or place the key file in Drive secrets/."
                 )
-            eff_timeout = (
-                float(self._timeout_sec)
-                if self._timeout_sec is not None
-                else float(self.models_cfg.openai.timeout_sec)
-            )
+            eff_timeout = self._effective_timeout_sec()
             init_kwargs: dict[str, Any] = {
                 "api_key": self._api_key,
                 "timeout": eff_timeout,
+                # Disable nested SDK retries so tenacity owns retry budget cleanly (avoids 3x5=15x timeout hangs).
+                "max_retries": 0,
             }
             if self._base_url:
                 init_kwargs["base_url"] = self._base_url
@@ -276,17 +331,16 @@ class OpenAIClient:
         }
         if seed is not None:
             kwargs["seed"] = seed
-        if max_tokens is not None:
+        # Cap structured JSON calls at 1536 output tokens when caller leaves max_tokens=None
+        # (prevents 32k-token infinite whitespace/repetition loops on gpt-4.1 without changing cache_payload).
+        eff_max_tokens = max_tokens if max_tokens is not None else (1536 if response_format is not None else None)
+        if eff_max_tokens is not None:
             if _uses_max_completion_tokens(model, self.provider_name):
-                kwargs["max_completion_tokens"] = max_tokens
+                kwargs["max_completion_tokens"] = eff_max_tokens
             else:
-                kwargs["max_tokens"] = max_tokens
+                kwargs["max_tokens"] = eff_max_tokens
         if response_format is not None:
-            # Many non-OpenAI OpenAI-compatible gateways do not support strict json_schema; start cleanly
-            if self.provider_name != "openai" and response_format.get("type") == "json_schema":
-                kwargs["response_format"] = {"type": "json_object"}
-            else:
-                kwargs["response_format"] = response_format
+            kwargs["response_format"] = _prepare_outgoing_response_format(response_format, self.provider_name)
         has_tool_history = any(
             isinstance(m, dict) and (m.get("role") == "tool" or m.get("tool_calls"))
             for m in messages
@@ -299,12 +353,17 @@ class OpenAIClient:
         if tool_choice is not None:
             kwargs["tool_choice"] = tool_choice
 
+        hard_timeout = self._effective_timeout_sec() + 5.0
+
         async def _create_with_compat(call_kwargs: dict[str, Any]) -> Any:
             client = self._get_client()
             cur = dict(call_kwargs)
             for _ in range(5):
                 try:
-                    return await client.chat.completions.create(**cur)
+                    return await asyncio.wait_for(
+                        client.chat.completions.create(**cur),
+                        timeout=hard_timeout,
+                    )
                 except BadRequestError as exc:
                     err_l = str(exc).lower()
                     changed = False
@@ -335,11 +394,16 @@ class OpenAIClient:
                         changed = True
                     if not changed:
                         raise
-            return await client.chat.completions.create(**cur)
+            return await asyncio.wait_for(
+                client.chat.completions.create(**cur),
+                timeout=hard_timeout,
+            )
 
-        async def _invoke() -> Any:
+        async def _invoke(override_kwargs: dict[str, Any] | None = None) -> Any:
+            base_kw = dict(kwargs if override_kwargs is None else override_kwargs)
             while True:
                 try:
+                    attempt_num = 0
                     async for attempt in AsyncRetrying(
                         reraise=True,
                         stop=stop_after_attempt(self._max_retries),
@@ -347,7 +411,27 @@ class OpenAIClient:
                         retry=retry_if_exception(_is_retryable_error),
                     ):
                         with attempt:
-                            return await _create_with_compat(kwargs)
+                            attempt_num += 1
+                            run_kw = dict(base_kw)
+                            # On repeated retries of a deterministic JSON call, perturb seed/temperature to escape repetition loops.
+                            if attempt_num >= 2 and response_format is not None:
+                                run_kw.pop("seed", None)
+                                if float(run_kw.get("temperature", 0.0) or 0.0) == 0.0:
+                                    run_kw["temperature"] = 0.2
+                            try:
+                                return await _create_with_compat(run_kw)
+                            except _TRANSIENT_ERRORS as exc:
+                                if not _is_quota_exhausted_error(exc):
+                                    logger.warning(
+                                        "Transient error on %s/%s (attempt %d/%d): %s: %s",
+                                        self.provider_name,
+                                        model,
+                                        attempt_num,
+                                        self._max_retries,
+                                        type(exc).__name__,
+                                        str(exc)[:180],
+                                    )
+                                raise
                 except RateLimitError as exc:
                     if _is_quota_exhausted_error(exc) and self._rotate_api_key():
                         continue
@@ -359,7 +443,7 @@ class OpenAIClient:
             choice = response.choices[0]
             msg = choice.message
             content = msg.content or ""
-            # If gateway returned empty/truncated non-JSON for a JSON request, retry once automatically
+            # If gateway returned empty/truncated non-JSON for a JSON request, retry once with perturbed sampling
             if response_format is not None:
                 try:
                     parsed_json = _extract_json_object(content) if content else None
@@ -367,11 +451,14 @@ class OpenAIClient:
                     parsed_json = None
                 if parsed_json is None:
                     logger.warning(
-                        "Malformed/empty JSON from %s/%s; re-sending request once.",
+                        "Malformed/empty JSON from %s/%s; re-sending request once with perturbed sampling.",
                         self.provider_name,
                         model,
                     )
-                    response = await _invoke()
+                    retry_kw = dict(kwargs)
+                    retry_kw.pop("seed", None)
+                    retry_kw["temperature"] = max(0.3, float(retry_kw.get("temperature", 0.0) or 0.0))
+                    response = await _invoke(retry_kw)
                     choice = response.choices[0]
                     msg = choice.message
                     content = msg.content or ""
