@@ -109,6 +109,12 @@ def test_b0_b1_b2_baselines_execute_and_respect_silence(tmp_path: Path) -> None:
     msg_quiet = [ChatMessage(msg_id="m2", speaker="bob", text="Sounds good, see you tomorrow!")]
 
     b0 = DirectChatBaseline(openai_client=oai, model="gpt-6-luna")
+    b0_forced = DirectChatBaseline(
+        openai_client=oai,
+        model="gpt-6-luna",
+        extra_memory_block="An intervention IS warranted; do NOT output SILENT.",
+        method_name="B0_direct_forced",
+    )
     b1_llm = SingleGateBaseline(openai_client=oai, gate_model="gpt-6-luna", gate_source="llm")
     b2 = ProACTBaseline(openai_client=oai, gate_model="gpt-6-luna")
 
@@ -134,6 +140,7 @@ def test_b0_b1_b2_baselines_execute_and_respect_silence(tmp_path: Path) -> None:
         out = {
             "b0_need": await b0.run_episode(sample_id="1", conversation_id="c1", channel_name="#g", messages=msg_need, benchmark="when2speak"),
             "b0_quiet": await b0.run_episode(sample_id="2", conversation_id="c2", channel_name="#g", messages=msg_quiet, benchmark="when2speak"),
+            "b0_forced": await b0_forced.run_episode(sample_id="2b", conversation_id="c2", channel_name="#g", messages=msg_need, benchmark="when2speak"),
             "b1_need": await b1_llm.run_episode(sample_id="3", conversation_id="c1", channel_name="#g", messages=msg_need, benchmark="when2speak", generate_text=False),
             "b1_quiet": await b1_llm.run_episode(sample_id="4", conversation_id="c2", channel_name="#g", messages=msg_quiet, benchmark="when2speak", generate_text=False),
             "b1_jev": await b1_jev.run_episode(sample_id="5", conversation_id="c1", channel_name="#g", messages=msg_need, benchmark="when2speak", generate_text=False),
@@ -147,6 +154,7 @@ def test_b0_b1_b2_baselines_execute_and_respect_silence(tmp_path: Path) -> None:
     assert res["b0_need"].gate.binary_speak is True
     assert res["b0_need"].gate.final_tier == InterventionTier.THREAD_BRIEF
     assert res["b0_quiet"].gate.binary_speak is False
+    assert res["b0_forced"].metadata["extra_memory_tokens"] > 0
     assert res["b1_need"].gate.binary_speak is True
     assert res["b1_quiet"].gate.binary_speak is False
     assert res["b1_jev"].gate.binary_speak is True
@@ -454,4 +462,94 @@ def test_direct_sc3_continuous_proact_platt_calibration_and_statistical_tests(tm
     assert holm["m1"]["significant_at_alpha"] is True
     assert holm["m2"]["significant_at_alpha"] is True
     assert holm["m3"]["significant_at_alpha"] is False
+
+
+def test_concurrent_pipeline_triage_and_gate_cost_isolation(tmp_path: Path) -> None:
+    from dial_skill.config import load_dial_skill_config
+    from dial_skill.core.pipeline import DialSkillAgent
+
+    class _DelayedGateOpenAI:
+        async def create(self, **kwargs: Any) -> Any:
+            await asyncio.sleep(0.01)
+            content = json.dumps(
+                {
+                    "advocate_score": 0.72,
+                    "unmitigated_loss": "Open question.",
+                    "recommended_skill": "none",
+                    "minimum_effective_channel": "THREAD_BRIEF",
+                    "skeptic_score": 0.28,
+                    "disruption_risk": "Low risk.",
+                    "matched_veto_conditions": [],
+                    "max_acceptable_channel": "THREAD_BRIEF",
+                    "cited_evidence_ids": ["m0"],
+                }
+            )
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=content, tool_calls=None))],
+                usage=SimpleNamespace(prompt_tokens=200, completion_tokens=50),
+            )
+
+    class _DelayedJevSDK:
+        async def system_one(self, **kwargs: Any) -> Any:
+            await asyncio.sleep(0.01)
+            return {
+                "answers": {
+                    "decision_change": {"probability": 0.85},
+                    "stance": {
+                        "choice": "need_signal",
+                        "probabilities": {
+                            "need_signal": 0.85,
+                            "defer_or_resolved_signal": 0.05,
+                            "scope_risk_signal": 0.05,
+                            "background_chatter": 0.05,
+                        },
+                    },
+                    "skill_hint": {"choice": "none", "probabilities": {"none": 1.0}},
+                    "urgency": {"score": 0.6},
+                }
+            }
+
+    cache = SQLiteAPICache(tmp_path / "conc_cost.sqlite")
+    oai = OpenAIClient(
+        api_key="k",
+        cache=cache,
+        async_client=SimpleNamespace(chat=SimpleNamespace(completions=_DelayedGateOpenAI())),
+    )
+    tc = TriageClient(cache=cache, jev_api_key="k", sdk_client=_DelayedJevSDK())
+    cfg = load_dial_skill_config(overrides={"ablation": {"gate_mode": "single_combined"}})
+    agent = DialSkillAgent(
+        triage_client=tc,
+        openai_client=oai,
+        gate_model="gpt-4.1-mini",
+        executor_model="gpt-4.1-mini",
+        cfg=cfg,
+    )
+
+    # Run 4 distinct 2-message episodes concurrently sharing one TriageClient & OpenAIClient
+    async def _run() -> list[EpisodeResult]:
+        return await asyncio.gather(
+            *(
+                agent.run_episode(
+                    sample_id=f"ep_{i}",
+                    conversation_id=f"conv_{i}",
+                    channel_name="#g",
+                    messages=[
+                        ChatMessage(msg_id="m0", speaker="alice", text=f"Context {i}"),
+                        ChatMessage(msg_id="m1", speaker="bob", text=f"Question {i}?"),
+                    ],
+                    benchmark="when2speak",
+                    generate_text=False,
+                )
+                for i in range(4)
+            )
+        )
+
+    eps = asyncio.run(_run())
+    expected_triage = 2 * float(tc.models_cfg.jev.cost_per_call_usd)
+    expected_gate = oai.estimate_cost_usd("gpt-4.1-mini", 200, 50)
+    expected_single = expected_triage + expected_gate
+    for ep in eps:
+        assert abs(ep.total_cost_usd - expected_single) < 1e-6
+        assert abs(ep.uncached_cost_usd - expected_single) < 1e-6
+    cache.close()
 

@@ -52,6 +52,7 @@ class DirectChatBaseline:
         tool_output_max_chars: int = 3000,
         temperature: float = 0.0,
         seed: int = 42,
+        extra_memory_block: str = "",
         method_name: str = "B0_direct_chat",
     ) -> None:
         self.openai_client = openai_client
@@ -62,6 +63,7 @@ class DirectChatBaseline:
         self.tool_output_max_chars = tool_output_max_chars
         self.temperature = temperature
         self.seed = seed
+        self.extra_memory_block = extra_memory_block
         self.method_name = method_name
 
     async def run_episode(
@@ -82,9 +84,12 @@ class DirectChatBaseline:
     ) -> EpisodeResult:
         raw_text = _format_raw_history(channel_name, messages)
         raw_tokens = estimate_tokens(raw_text)
+        combined_memory = "\n\n".join(
+            blk.strip() for blk in (self.extra_memory_block, extra_memory_block) if blk and blk.strip()
+        )
         sys_prompt = DIRECT_CHAT_SYSTEM_PROMPT
-        if extra_memory_block:
-            sys_prompt = f"{sys_prompt}\n\n{extra_memory_block}"
+        if combined_memory:
+            sys_prompt = f"{sys_prompt}\n\n{combined_memory}"
 
         chat_msgs: list[dict[str, Any]] = [
             {"role": "system", "content": sys_prompt},
@@ -201,7 +206,7 @@ class DirectChatBaseline:
             total_cost_usd=round(cost, 8),
             uncached_cost_usd=round(max(cost, uncached_cost), 8),
             triage_backend_used="none",
-            metadata={"tool_trace": tool_trace, "extra_memory_tokens": estimate_tokens(extra_memory_block)},
+            metadata={"tool_trace": tool_trace, "extra_memory_tokens": estimate_tokens(combined_memory)},
         )
 
 

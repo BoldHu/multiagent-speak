@@ -1,15 +1,17 @@
 """Multi-source secret loader enforcing Invariant #6 (never hardcode or commit keys).
 
 Lookup order:
-1. Environment variables (`TYPESAFE_API_KEY` / `JEV_API_KEY`, `OPENAI_API_KEY`)
+1. Environment variables (`TYPESAFE_API_KEY` / `JEV_API_KEY`, `OPENAI_API_KEY_2` / `OPENAI_API_KEY`)
 2. Google Drive secrets folder (`/content/drive/MyDrive/when2speak_research/secrets/` or `$DIAL_SKILL_DRIVE_ROOT/secrets/`)
+   - Automatically prefers higher-numbered key files (e.g. `OPENAI_KEY_2.txt` before `OPENAI_KEY.txt`).
 3. Colab `userdata` secrets (`google.colab.userdata`)
-4. Local workspace root (`./JEV_API_KEY.txt`, `./OPENAI_KEY.txt`)
+4. Local workspace root (`./OPENAI_KEY_2.txt`, `./OPENAI_KEY.txt`, `./JEV_API_KEY.txt`)
 """
 
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Sequence
 
@@ -82,6 +84,81 @@ def _load_from_colab_userdata(secret_names: Sequence[str]) -> str | None:
     return None
 
 
+def _list_candidate_key_files(directory: Path, primary_filename: str) -> list[Path]:
+    """Return key files in priority order: highest numbered `<stem>_<N><suffix>` first, then `<primary_filename>`."""
+    primary_path = directory / primary_filename
+    stem = primary_path.stem
+    suffix = primary_path.suffix
+    numbered: list[tuple[int, Path]] = []
+    if directory.is_dir():
+        pattern = re.compile(rf"^{re.escape(stem)}_(\d+){re.escape(suffix)}$", re.IGNORECASE)
+        try:
+            for child in directory.iterdir():
+                if not child.is_file():
+                    continue
+                match = pattern.match(child.name)
+                if match:
+                    numbered.append((int(match.group(1)), child))
+        except OSError:
+            pass
+    numbered.sort(key=lambda pair: pair[0], reverse=True)
+    candidates = [path for _, path in numbered]
+    candidates.append(primary_path)
+    return candidates
+
+
+def _resolve_all_secrets(
+    env_names: Sequence[str],
+    filename: str,
+    drive_root: str | Path | None = None,
+    workspace_root: str | Path | None = None,
+) -> list[tuple[str, str]]:
+    """Return all discovered `(secret_value, source_label)` pairs in 4-tier priority order, deduplicated by value."""
+    found: list[tuple[str, str]] = []
+    seen_values: set[str] = set()
+
+    def _add(val: str | None, source: str) -> None:
+        if val and val not in seen_values:
+            seen_values.add(val)
+            found.append((val, source))
+
+    # 1. Environment variables
+    for env_name in env_names:
+        val = os.environ.get(env_name)
+        if val and val.strip():
+            _add(val.strip(), f"env:{env_name}")
+
+    # 2. Google Drive secrets folder (numbered keys e.g. OPENAI_KEY_2.txt preferred over OPENAI_KEY.txt)
+    drive_dirs: list[Path] = [get_drive_root(drive_root) / "secrets"]
+    if drive_root is None:
+        colab_secrets_dir = COLAB_DEFAULT_DRIVE_ROOT / "secrets"
+        if colab_secrets_dir not in drive_dirs:
+            drive_dirs.append(colab_secrets_dir)
+    for secrets_dir in drive_dirs:
+        for candidate in _list_candidate_key_files(secrets_dir, filename):
+            _add(_parse_key_file(candidate), f"drive:{candidate.name}")
+
+    # 3. Colab userdata
+    val = _load_from_colab_userdata(env_names)
+    if val:
+        _add(val, "colab_userdata")
+
+    # 4. Local workspace root (numbered keys preferred over primary filename)
+    ws_dirs: list[Path] = []
+    if workspace_root is not None:
+        ws_dirs.append(Path(workspace_root))
+    else:
+        ws_dirs.append(Path.cwd())
+        repo_root = find_repo_root()
+        if repo_root not in ws_dirs:
+            ws_dirs.append(repo_root)
+    for ws_dir in ws_dirs:
+        for candidate in _list_candidate_key_files(ws_dir, filename):
+            _add(_parse_key_file(candidate), f"local:{candidate.name}")
+
+    return found
+
+
 def _resolve_secret(
     env_names: Sequence[str],
     filename: str,
@@ -89,42 +166,14 @@ def _resolve_secret(
     workspace_root: str | Path | None = None,
 ) -> tuple[str | None, str]:
     """Return (secret_value, source_label) following the authoritative 4-tier lookup order."""
-    # 1. Environment variables
-    for env_name in env_names:
-        val = os.environ.get(env_name)
-        if val and val.strip():
-            return val.strip(), f"env:{env_name}"
-
-    # 2. Google Drive secrets folder
-    drive_candidates: list[Path] = [get_drive_root(drive_root) / "secrets" / filename]
-    if drive_root is None:
-        colab_secret_path = COLAB_DEFAULT_DRIVE_ROOT / "secrets" / filename
-        if colab_secret_path not in drive_candidates:
-            drive_candidates.append(colab_secret_path)
-    for candidate in drive_candidates:
-        val = _parse_key_file(candidate)
-        if val:
-            return val, f"drive:{candidate.name}"
-
-    # 3. Colab userdata
-    val = _load_from_colab_userdata(env_names)
-    if val:
-        return val, "colab_userdata"
-
-    # 4. Local workspace root
-    ws_candidates: list[Path] = []
-    if workspace_root is not None:
-        ws_candidates.append(Path(workspace_root) / filename)
-    else:
-        ws_candidates.append(Path.cwd() / filename)
-        repo_root = find_repo_root()
-        if repo_root / filename not in ws_candidates:
-            ws_candidates.append(repo_root / filename)
-    for candidate in ws_candidates:
-        val = _parse_key_file(candidate)
-        if val:
-            return val, f"local:{candidate.name}"
-
+    resolved = _resolve_all_secrets(
+        env_names=env_names,
+        filename=filename,
+        drive_root=drive_root,
+        workspace_root=workspace_root,
+    )
+    if resolved:
+        return resolved[0]
     return None, "missing"
 
 
@@ -148,21 +197,35 @@ def load_jev_api_key(
     return val
 
 
+def load_openai_api_keys(
+    drive_root: str | Path | None = None,
+    workspace_root: str | Path | None = None,
+) -> list[tuple[str, str]]:
+    """Return all discovered OpenAI keys as `(source_label, value)` in priority order (newest numbered key first)."""
+    resolved = _resolve_all_secrets(
+        env_names=("OPENAI_API_KEY_2", "OPENAI_API_KEY"),
+        filename="OPENAI_KEY.txt",
+        drive_root=drive_root,
+        workspace_root=workspace_root,
+    )
+    return [(src, val) for val, src in resolved]
+
+
 def load_openai_api_key(
     drive_root: str | Path | None = None,
     workspace_root: str | Path | None = None,
     required: bool = False,
 ) -> str | None:
-    """Load OpenAI API key following the 4-tier lookup order."""
+    """Load OpenAI API key following the 4-tier lookup order (preferring numbered keys like OPENAI_KEY_2.txt)."""
     val, _ = _resolve_secret(
-        env_names=("OPENAI_API_KEY",),
+        env_names=("OPENAI_API_KEY_2", "OPENAI_API_KEY"),
         filename="OPENAI_KEY.txt",
         drive_root=drive_root,
         workspace_root=workspace_root,
     )
     if required and not val:
         raise RuntimeError(
-            "Missing OpenAI API key. Set OPENAI_API_KEY, place OPENAI_KEY.txt "
+            "Missing OpenAI API key. Set OPENAI_API_KEY, place OPENAI_KEY_2.txt / OPENAI_KEY.txt "
             "in Drive secrets/, Colab userdata, or workspace root."
         )
     return val
@@ -198,7 +261,7 @@ def describe_secret_sources(
         ("TYPESAFE_API_KEY", "JEV_API_KEY"), "JEV_API_KEY.txt", drive_root, workspace_root
     )
     oai_val, oai_src = _resolve_secret(
-        ("OPENAI_API_KEY",), "OPENAI_KEY.txt", drive_root, workspace_root
+        ("OPENAI_API_KEY_2", "OPENAI_API_KEY"), "OPENAI_KEY.txt", drive_root, workspace_root
     )
     out = {
         "jev": {"status": "found" if jev_val else "missing", "source": jev_src, "masked": mask_secret(jev_val)},

@@ -1020,6 +1020,7 @@ class OfficialDialSkillAgent:
             )
             recon.model_elapsed_sec += llm_res.elapsed_sec
             recon.cost_usd += llm_res.cost_usd
+            recon.uncached_cost_usd += llm_res.uncached_cost_usd
             prompt_tokens += llm_res.prompt_tokens
             completion_tokens += llm_res.completion_tokens
 
@@ -1074,7 +1075,6 @@ class OfficialDialSkillAgent:
         max_parallel_reads = int(session.limits.get("max_read_calls_per_response", 8))
 
         chat_messages = format_initial_context_messages(session.initial_context)
-        triage_cost_before = self.triage_client.total_cost_usd
 
         # Stage 1: System-1 Decision-Change Triage & Balanced SSES
         triage_out = await self.triage_stage.run(
@@ -1084,7 +1084,8 @@ class OfficialDialSkillAgent:
             messages=chat_messages,
             skill_store=self.skill_store,
         )
-        triage_cost = max(0.0, self.triage_client.total_cost_usd - triage_cost_before)
+        triage_cost = triage_out.triage_cost_usd
+        triage_uncached = max(triage_cost, triage_out.triage_uncached_cost_usd)
 
         if triage_out.short_circuited:
             gate = GateDecision(
@@ -1116,6 +1117,7 @@ class OfficialDialSkillAgent:
                 model_elapsed_sec=0.0,
                 timed_out=False,
                 total_cost_usd=round(triage_cost, 8),
+                uncached_cost_usd=round(triage_uncached, 8),
                 gate=gate,
                 tool_trace=[],
                 initial_context_summary=_summarize_initial_context(session.initial_context),
@@ -1143,20 +1145,17 @@ class OfficialDialSkillAgent:
             slate = rebuild_slate_with_recon(slate, recon.snippets)
 
         # Stage 2: Parallel Symmetric-Evidence Dialectic Gating
-        gate_decision, gate_cost, gate_elapsed = await self.gate_stage.evaluate(
+        gate_decision, gate_cost, gate_uncached, gate_elapsed = await self.gate_stage.evaluate_with_cost(
             advocate_slate=slate,
             skeptic_slate=slate,
             skill_store=self.skill_store,
         )
 
-        triage_uncached = max(
-            triage_cost,
-            getattr(self.triage_client, "uncached_cost_usd", self.triage_client.total_cost_usd),
-        )
-        gate_uncached = max(gate_cost, getattr(self.gate_stage, "last_uncached_cost_usd", gate_cost))
         model_elapsed = recon.model_elapsed_sec + gate_elapsed
         total_cost = triage_cost + recon.cost_usd + gate_cost
-        uncached_cost = triage_uncached + max(recon.cost_usd, recon.uncached_cost_usd) + gate_uncached
+        uncached_cost = (
+            triage_uncached + max(recon.cost_usd, recon.uncached_cost_usd) + max(gate_cost, gate_uncached)
+        )
         prompt_tokens = recon_pt
         completion_tokens = recon_ct
 
@@ -1179,6 +1178,7 @@ class OfficialDialSkillAgent:
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 total_cost_usd=round(total_cost, 8),
+                uncached_cost_usd=round(max(total_cost, uncached_cost), 8),
                 gate=gate_decision,
                 tool_trace=list(session.tool_trace),
                 initial_context_summary=_summarize_initial_context(session.initial_context),
@@ -1690,6 +1690,7 @@ class OfficialDialSkillV2Agent:
             )
             recon.model_elapsed_sec += llm_res.elapsed_sec
             recon.cost_usd += llm_res.cost_usd
+            recon.uncached_cost_usd += llm_res.uncached_cost_usd
             prompt_tokens += llm_res.prompt_tokens
             completion_tokens += llm_res.completion_tokens
 
@@ -1744,12 +1745,13 @@ class OfficialDialSkillV2Agent:
         max_parallel_reads = int(session.limits.get("max_read_calls_per_response", 8))
 
         threads = partition_snapshot_into_threads(session.initial_context)
-        triage_cost_before = self.triage_client.total_cost_usd
 
         # Stage 1: Per-Thread System-1 Decision-Change Triage
         surviving: list[tuple[ThreadCandidate, Any]] = []
         pruned_thread_ids: list[str] = []
         triage_backend_used = "jev"
+        triage_cost = 0.0
+        triage_uncached = 0.0
 
         for thread in threads:
             t_out = await self.triage_stage.run(
@@ -1760,12 +1762,12 @@ class OfficialDialSkillV2Agent:
                 skill_store=self.skill_store,
             )
             triage_backend_used = t_out.triage_backend_used
+            triage_cost += t_out.triage_cost_usd
+            triage_uncached += max(t_out.triage_cost_usd, t_out.triage_uncached_cost_usd)
             if self._is_obvious_decoy_thread(t_out):
                 pruned_thread_ids.append(thread.thread_id)
             else:
                 surviving.append((thread, t_out))
-
-        triage_cost = max(0.0, self.triage_client.total_cost_usd - triage_cost_before)
 
         if not surviving:
             gate = GateDecision(
@@ -1797,6 +1799,7 @@ class OfficialDialSkillV2Agent:
                 model_elapsed_sec=0.0,
                 timed_out=False,
                 total_cost_usd=round(triage_cost, 8),
+                uncached_cost_usd=round(max(triage_cost, triage_uncached), 8),
                 gate=gate,
                 tool_trace=[],
                 initial_context_summary=_summarize_initial_context(session.initial_context),
@@ -1828,13 +1831,12 @@ class OfficialDialSkillV2Agent:
                 if thread_snips
                 else t_out.slate
             )
-            g_dec, g_cost, g_sec = await self.gate_stage.evaluate(
+            g_dec, g_cost, g_unc, g_sec = await self.gate_stage.evaluate_with_cost(
                 advocate_slate=iso_slate,
                 skeptic_slate=iso_slate,
                 skill_store=self.skill_store,
             )
-            g_unc = max(g_cost, getattr(self.gate_stage, "last_uncached_cost_usd", g_cost))
-            return thread, iso_slate, g_dec, g_cost, g_unc, g_sec
+            return thread, iso_slate, g_dec, g_cost, max(g_cost, g_unc), g_sec
 
         gate_results = await asyncio.gather(*(_eval_one_thread(th, to) for th, to in surviving))
         for th, iso_slate, g_dec, g_cost, g_unc, g_sec in gate_results:
@@ -1846,7 +1848,7 @@ class OfficialDialSkillV2Agent:
         model_elapsed = recon.model_elapsed_sec + gate_total_elapsed
         total_cost = triage_cost + recon.cost_usd + gate_total_cost
         uncached_cost = (
-            max(triage_cost, getattr(self.triage_client, "uncached_cost_usd", triage_cost))
+            max(triage_cost, triage_uncached)
             + max(recon.cost_usd, recon.uncached_cost_usd)
             + gate_total_uncached
         )
@@ -1903,6 +1905,7 @@ class OfficialDialSkillV2Agent:
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 total_cost_usd=round(total_cost, 8),
+                uncached_cost_usd=round(max(total_cost, uncached_cost), 8),
                 gate=primary_gate,
                 tool_trace=list(session.tool_trace),
                 initial_context_summary=_summarize_initial_context(session.initial_context),

@@ -8,7 +8,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Sequence
 
 import httpx
 from openai import (
@@ -20,11 +20,16 @@ from openai import (
     RateLimitError,
 )
 from pydantic import BaseModel
-from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt, wait_exponential
+from tenacity import (
+    AsyncRetrying,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from dial_skill.config import ModelsConfig, load_models_config
 from dial_skill.utils.cache import SQLiteAPICache, compute_prompt_hash
-from dial_skill.utils.secrets import load_openai_api_key
+from dial_skill.utils.secrets import load_openai_api_key, load_openai_api_keys, mask_secret
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +43,30 @@ _TRANSIENT_ERRORS = (
     httpx.TransportError,
     OSError,
 )
+
+
+def _is_quota_exhausted_error(exc: BaseException) -> bool:
+    """Return True for permanent billing/credit exhaustion (429 insufficient_quota / credit_balance_exhausted)."""
+    if not isinstance(exc, RateLimitError):
+        return False
+    msg = str(exc).lower()
+    body = getattr(exc, "body", None)
+    body_str = json.dumps(body).lower() if isinstance(body, dict) else str(body or "").lower()
+    hay = f"{msg} {body_str}"
+    return any(
+        tok in hay
+        for tok in (
+            "insufficient_quota",
+            "credit_balance_exhausted",
+            "exceeded your current quota",
+            "billing_hard_limit_reached",
+        )
+    )
+
+
+def _is_retryable_error(exc: BaseException) -> bool:
+    """Retry transient network/rate-limit errors, but fail fast on permanent quota exhaustion."""
+    return isinstance(exc, _TRANSIENT_ERRORS) and not _is_quota_exhausted_error(exc)
 
 
 class LLMCallResult(BaseModel):
@@ -118,17 +147,44 @@ class OpenAIClient:
         timeout_sec: float | None = None,
         base_url: str | None = None,
         provider_name: str = "openai",
+        fallback_api_keys: Sequence[str] | None = None,
     ) -> None:
         self.models_cfg = models_cfg or load_models_config()
         self.cache = cache if cache is not None else SQLiteAPICache()
         self._api_key = api_key if api_key is not None else load_openai_api_key(required=False)
         self._client = async_client
+        self._custom_async_client = async_client is not None
         self._max_retries = max_retries
         self._timeout_sec = timeout_sec
         self._base_url = base_url
         self.provider_name = provider_name
+        if fallback_api_keys is not None:
+            raw_fallbacks = list(fallback_api_keys)
+        elif api_key is None and provider_name == "openai" and async_client is None:
+            raw_fallbacks = [val for _, val in load_openai_api_keys()]
+        else:
+            raw_fallbacks = []
+        self._fallback_api_keys: list[str] = [
+            k.strip() for k in raw_fallbacks if k and k.strip() and k.strip() != (self._api_key or "").strip()
+        ]
         self._semaphore = asyncio.Semaphore(max(1, self.models_cfg.openai.max_concurrency))
         self.usage = UsageTracker()
+
+    def _rotate_api_key(self) -> bool:
+        """Switch to the next backup API key on permanent quota exhaustion; returns True if rotated."""
+        if self._custom_async_client or not self._fallback_api_keys:
+            return False
+        next_key = self._fallback_api_keys.pop(0)
+        old_masked = mask_secret(self._api_key)
+        self._api_key = next_key
+        self._client = None
+        logger.warning(
+            "Provider '%s' key %s exhausted quota; rotating to backup key %s.",
+            self.provider_name,
+            old_masked,
+            mask_secret(next_key),
+        )
+        return True
 
     def _get_client(self) -> Any:
         if self._client is None:
@@ -243,9 +299,8 @@ class OpenAIClient:
         if tool_choice is not None:
             kwargs["tool_choice"] = tool_choice
 
-        client = self._get_client()
-
         async def _create_with_compat(call_kwargs: dict[str, Any]) -> Any:
+            client = self._get_client()
             cur = dict(call_kwargs)
             for _ in range(5):
                 try:
@@ -283,14 +338,20 @@ class OpenAIClient:
             return await client.chat.completions.create(**cur)
 
         async def _invoke() -> Any:
-            async for attempt in AsyncRetrying(
-                reraise=True,
-                stop=stop_after_attempt(self._max_retries),
-                wait=wait_exponential(multiplier=1.0, min=1.0, max=20.0),
-                retry=retry_if_exception_type(_TRANSIENT_ERRORS),
-            ):
-                with attempt:
-                    return await _create_with_compat(kwargs)
+            while True:
+                try:
+                    async for attempt in AsyncRetrying(
+                        reraise=True,
+                        stop=stop_after_attempt(self._max_retries),
+                        wait=wait_exponential(multiplier=1.0, min=1.0, max=20.0),
+                        retry=retry_if_exception(_is_retryable_error),
+                    ):
+                        with attempt:
+                            return await _create_with_compat(kwargs)
+                except RateLimitError as exc:
+                    if _is_quota_exhausted_error(exc) and self._rotate_api_key():
+                        continue
+                    raise
 
         t0 = time.perf_counter()
         async with self._semaphore:

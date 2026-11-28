@@ -6,6 +6,9 @@ OPENAI_KEY.txt
 AUTODL_KEY.txt
 *_KEY.txt
 *_key.txt
+OPENAI_KEY_*.txt
+*_KEY_*.txt
+*_key_*.txt
 *.key
 .env
 .env.*

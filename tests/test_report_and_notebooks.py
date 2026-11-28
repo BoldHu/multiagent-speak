@@ -196,10 +196,12 @@ def test_all_seven_notebooks_valid_and_no_secret_files_tracked() -> None:
     errors = validate_all_notebooks(nb_dir)
     assert errors == [], f"Notebook validation errors: {errors}"
 
-    # Verify .gitignore blocks JEV_API_KEY.txt, OPENAI_KEY.txt, and AUTODL_KEY.txt
+    # Verify .gitignore blocks JEV_API_KEY.txt, OPENAI_KEY.txt, numbered keys (OPENAI_KEY_2.txt), and AUTODL_KEY.txt
     gitignore = (repo_root / ".gitignore").read_text(encoding="utf-8")
     assert "JEV_API_KEY.txt" in gitignore
     assert "OPENAI_KEY.txt" in gitignore
+    assert "OPENAI_KEY_*.txt" in gitignore
+    assert "*_KEY_*.txt" in gitignore
     assert "AUTODL_KEY.txt" in gitignore
 
     # Verify every `from dial_skill... import ...` symbol across Notebooks 10, 11, 12 exists!

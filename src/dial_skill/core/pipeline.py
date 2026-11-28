@@ -99,8 +99,6 @@ class DialSkillAgent:
         env_mode: Literal["when2speak", "pagemantle"] = (
             "when2speak" if benchmark == "when2speak" else "pagemantle"
         )
-        triage_cost_before = self.triage_client.total_cost_usd
-        triage_uncached_before = getattr(self.triage_client, "uncached_cost_usd", self.triage_client.total_cost_usd)
 
         # Stage 1: System-1 Decision-Change Triage & Balanced SSES
         triage_out = await self.triage_stage.run(
@@ -110,12 +108,8 @@ class DialSkillAgent:
             messages=messages,
             skill_store=self.skill_store,
         )
-        triage_cost = max(0.0, self.triage_client.total_cost_usd - triage_cost_before)
-        triage_uncached = max(
-            triage_cost,
-            getattr(self.triage_client, "uncached_cost_usd", self.triage_client.total_cost_usd)
-            - triage_uncached_before,
-        )
+        triage_cost = triage_out.triage_cost_usd
+        triage_uncached = max(triage_cost, triage_out.triage_uncached_cost_usd)
 
         # Fast-silence short-circuit
         if triage_out.short_circuited:
@@ -174,7 +168,7 @@ class DialSkillAgent:
                     skep_slate = slate
 
         # Stage 2: Parallel Symmetric-Evidence Dialectic Gating
-        gate_decision, gate_cost, gate_elapsed = await self.gate_stage.evaluate(
+        gate_decision, gate_cost, gate_uncached, gate_elapsed = await self.gate_stage.evaluate_with_cost(
             advocate_slate=adv_slate,
             skeptic_slate=skep_slate,
             skill_store=self.skill_store,
@@ -210,11 +204,10 @@ class DialSkillAgent:
             )
 
         total_cost = triage_cost + recon_res.cost_usd + gate_cost + exec_out.cost_usd
-        gate_uncached = max(gate_cost, getattr(self.gate_stage, "last_uncached_cost_usd", gate_cost))
         total_uncached = (
             triage_uncached
             + max(recon_res.cost_usd, recon_res.uncached_cost_usd)
-            + gate_uncached
+            + max(gate_cost, gate_uncached)
             + max(exec_out.cost_usd, exec_out.uncached_cost_usd)
         )
         total_tools = recon_res.tool_calls_used + exec_out.tool_calls_used

@@ -84,19 +84,22 @@ class SingleGateBaseline:
         if self.gate_source == "jev":
             if self.triage_client is None:
                 raise ValueError("SingleGateBaseline(gate_source='jev') requires triage_client.")
-            cost_before = self.triage_client.total_cost_usd
-            uncached_before = getattr(self.triage_client, "uncached_cost_usd", cost_before)
-            item = await self.triage_client.score_message(
-                channel_name=channel_name,
-                prior_messages=messages[:-1],
-                target_message=messages[-1],
-            )
-            cost += max(0.0, self.triage_client.total_cost_usd - cost_before)
-            uncached_cost += max(
-                cost,
-                getattr(self.triage_client, "uncached_cost_usd", self.triage_client.total_cost_usd)
-                - uncached_before,
-            )
+            if hasattr(self.triage_client, "score_message_with_cost"):
+                item, call_cost, call_uncached = await self.triage_client.score_message_with_cost(
+                    channel_name=channel_name,
+                    prior_messages=messages[:-1],
+                    target_message=messages[-1],
+                )
+            else:
+                item = await self.triage_client.score_message(
+                    channel_name=channel_name,
+                    prior_messages=messages[:-1],
+                    target_message=messages[-1],
+                )
+                call_cost = 0.0
+                call_uncached = 0.0
+            cost += call_cost
+            uncached_cost += max(call_cost, call_uncached)
             speak_prob = float(item.p_decision_change * item.stance_probs.get("need_signal", 0.0))
             rationale = f"jev_stance={item.stance}, p_chg={item.p_decision_change:.2f}"
             triage_used = item.backend

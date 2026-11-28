@@ -357,14 +357,14 @@ class DialecticGate:
         )
         return adv, skep, res
 
-    async def evaluate(
+    async def evaluate_with_cost(
         self,
         *,
         advocate_slate: SharedEvidenceSlate,
         skeptic_slate: SharedEvidenceSlate,
         skill_store: SkillStore,
-    ) -> tuple[GateDecision, float, float]:
-        """Run Stage-2 gating; returns (GateDecision, cost_usd, model_elapsed_sec)."""
+    ) -> tuple[GateDecision, float, float, float]:
+        """Concurrency-safe Stage-2 gating; returns `(GateDecision, billed_cost_usd, uncached_cost_usd, model_elapsed_sec)`."""
         # Enforce Non-Negotiable Invariant #1: Symmetric Shared Evidence Slate
         if not self.cfg.ablation.asymmetric_evidence:
             assert advocate_slate.slate_hash == skeptic_slate.slate_hash, (
@@ -437,6 +437,7 @@ class DialecticGate:
         else:
             raise ValueError(f"Unsupported gate_mode: {mode}")
 
+        uncached_cost = max(cost, uncached_cost)
         self.last_uncached_cost_usd = uncached_cost
 
         decision = compute_gate_decision(
@@ -445,5 +446,20 @@ class DialecticGate:
             skeptic=skep_out,
             skill_store=skill_store,
             cfg=self.cfg,
+        )
+        return decision, cost, uncached_cost, elapsed
+
+    async def evaluate(
+        self,
+        *,
+        advocate_slate: SharedEvidenceSlate,
+        skeptic_slate: SharedEvidenceSlate,
+        skill_store: SkillStore,
+    ) -> tuple[GateDecision, float, float]:
+        """Run Stage-2 gating; returns (GateDecision, cost_usd, model_elapsed_sec)."""
+        decision, cost, _, elapsed = await self.evaluate_with_cost(
+            advocate_slate=advocate_slate,
+            skeptic_slate=skeptic_slate,
+            skill_store=skill_store,
         )
         return decision, cost, elapsed

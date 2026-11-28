@@ -116,6 +116,73 @@ def test_secret_lookup_priority_and_masking(tmp_path: Path, monkeypatch: pytest.
     assert load_autodl_api_key(drive_root=drive_root, workspace_root=ws_root) == "sk-autodl-testkey998877"
 
 
+def test_numbered_openai_key_priority_and_quota_failfast(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from openai import RateLimitError
+    from dial_skill.utils.secrets import describe_secret_sources, load_openai_api_keys
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY_2", raising=False)
+
+    drive_root = tmp_path / "drive"
+    (drive_root / "secrets").mkdir(parents=True)
+    ws_root = tmp_path / "ws"
+    ws_root.mkdir()
+
+    # Local OPENAI_KEY_2.txt overrides local OPENAI_KEY.txt
+    (ws_root / "OPENAI_KEY.txt").write_text("sk-local-old-11111111\n", encoding="utf-8")
+    (ws_root / "OPENAI_KEY_2.txt").write_text("sk-local-new-22222222\n", encoding="utf-8")
+    assert load_openai_api_key(drive_root=drive_root, workspace_root=ws_root) == "sk-local-new-22222222"
+    diag_local = describe_secret_sources(drive_root=drive_root, workspace_root=ws_root)
+    assert diag_local["openai"]["source"] == "local:OPENAI_KEY_2.txt"
+
+    # Drive OPENAI_KEY_2.txt overrides Drive OPENAI_KEY.txt and local keys
+    (drive_root / "secrets" / "OPENAI_KEY.txt").write_text("sk-drive-old-11111111\n", encoding="utf-8")
+    (drive_root / "secrets" / "OPENAI_KEY_2.txt").write_text("sk-drive-new-22222222\n", encoding="utf-8")
+    assert load_openai_api_key(drive_root=drive_root, workspace_root=ws_root) == "sk-drive-new-22222222"
+    diag_drive = describe_secret_sources(drive_root=drive_root, workspace_root=ws_root)
+    assert diag_drive["openai"]["source"] == "drive:OPENAI_KEY_2.txt"
+
+    # Higher numbered key (OPENAI_KEY_3.txt) wins automatically
+    (drive_root / "secrets" / "OPENAI_KEY_3.txt").write_text("sk-drive-newest-33333333\n", encoding="utf-8")
+    assert load_openai_api_key(drive_root=drive_root, workspace_root=ws_root) == "sk-drive-newest-33333333"
+    all_keys = load_openai_api_keys(drive_root=drive_root, workspace_root=ws_root)
+    assert [src for src, _ in all_keys[:3]] == [
+        "drive:OPENAI_KEY_3.txt",
+        "drive:OPENAI_KEY_2.txt",
+        "drive:OPENAI_KEY.txt",
+    ]
+
+    # Permanent 429 credit_balance_exhausted MUST fail fast (1 attempt, NOT 5 retries!)
+    calls = {"n": 0}
+
+    class _QuotaExhaustedCompletions:
+        async def create(self, **kwargs: Any) -> Any:
+            calls["n"] += 1
+            req = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+            resp = httpx.Response(429, request=req)
+            raise RateLimitError(
+                "Error code: 429 - {'error': {'type': 'insufficient_quota', 'code': 'credit_balance_exhausted'}}",
+                response=resp,
+                body={"error": {"type": "insufficient_quota", "code": "credit_balance_exhausted"}},
+            )
+
+    fake_exhausted = SimpleNamespace(chat=SimpleNamespace(completions=_QuotaExhaustedCompletions()))
+    cache = SQLiteAPICache(tmp_path / "quota_cache.sqlite")
+    client = OpenAIClient(api_key="sk-empty", cache=cache, async_client=fake_exhausted, max_retries=5)
+    with pytest.raises(RateLimitError):
+        asyncio.run(
+            client.complete_text(
+                model="gpt-4.1-mini",
+                messages=[{"role": "user", "content": "ping"}],
+                use_cache=False,
+            )
+        )
+    assert calls["n"] == 1
+    cache.close()
+
+
 def test_sqlite_cache_five_tuple_key_and_persistence(tmp_path: Path) -> None:
     db_path = tmp_path / "api_cache.sqlite"
     cache = SQLiteAPICache(db_path)

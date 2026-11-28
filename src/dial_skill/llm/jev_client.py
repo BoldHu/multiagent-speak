@@ -340,12 +340,12 @@ class OpenAILunaTriageFallback:
         self.seed = seed
         self.last_uncached_cost_usd: float = 0.0
 
-    async def score_message(
+    async def score_message_with_cost(
         self,
         channel_name: str,
         prior_messages: list[ChatMessage],
         target_message: ChatMessage,
-    ) -> tuple[TriageItem, float]:
+    ) -> tuple[TriageItem, float, float]:
         prior_window = prior_messages[-2:]
         if prior_window:
             prior_fmt = "\n".join(f"[{m.msg_id}] {m.speaker}: {m.text}" for m in prior_window)
@@ -373,8 +373,20 @@ class OpenAILunaTriageFallback:
         item = parse_jev_response_to_triage_item(
             data, msg_id=target_message.msg_id, backend="openai_fallback"
         )
-        self.last_uncached_cost_usd = res.uncached_cost_usd
-        return item, res.cost_usd
+        uncached = max(res.cost_usd, res.uncached_cost_usd)
+        self.last_uncached_cost_usd = uncached
+        return item, res.cost_usd, uncached
+
+    async def score_message(
+        self,
+        channel_name: str,
+        prior_messages: list[ChatMessage],
+        target_message: ChatMessage,
+    ) -> tuple[TriageItem, float]:
+        item, cost, _ = await self.score_message_with_cost(
+            channel_name, prior_messages, target_message
+        )
+        return item, cost
 
 
 class TriageClient:
@@ -546,16 +558,32 @@ class TriageClient:
         backend_override: Literal["jev", "openai_fallback"] | None = None,
     ) -> TriageItem:
         """Score a single message with caching and graceful Jev -> OpenAI Luna fallback."""
+        item, _, _ = await self.score_message_with_cost(
+            channel_name=channel_name,
+            prior_messages=prior_messages,
+            target_message=target_message,
+            backend_override=backend_override,
+        )
+        return item
+
+    async def score_message_with_cost(
+        self,
+        channel_name: str,
+        prior_messages: list[ChatMessage],
+        target_message: ChatMessage,
+        backend_override: Literal["jev", "openai_fallback"] | None = None,
+    ) -> tuple[TriageItem, float, float]:
+        """Concurrency-safe variant returning `(TriageItem, billed_cost_usd, uncached_cost_usd)`."""
         active_backend = backend_override or self.backend
 
         if active_backend == "openai_fallback":
             fb = self._get_fallback()
-            item, cost = await fb.score_message(
+            item, cost, uncached = await fb.score_message_with_cost(
                 channel_name, prior_messages, target_message
             )
             self.total_cost_usd += cost
-            self.uncached_cost_usd += max(cost, fb.last_uncached_cost_usd)
-            return item
+            self.uncached_cost_usd += uncached
+            return item, cost, uncached
 
         state_payload = build_jev_state_payload(channel_name, prior_messages, target_message)
         cache_payload = build_jev_cache_key_payload(channel_name, prior_messages, target_message)
@@ -591,12 +619,14 @@ class TriageClient:
                 )
         if cached is not None:
             self.cache_hits += 1
-            self.uncached_cost_usd += float(self.models_cfg.jev.cost_per_call_usd)
-            return TriageItem.model_validate(cached).model_copy(update={"msg_id": target_message.msg_id})
+            uncached_call = float(self.models_cfg.jev.cost_per_call_usd)
+            self.uncached_cost_usd += uncached_call
+            item = TriageItem.model_validate(cached).model_copy(update={"msg_id": target_message.msg_id})
+            return item, 0.0, uncached_call
 
         # 2. If circuit breaker tripped (e.g., quota exhausted / auth error / missing key), fall back cleanly
         if self._jev_circuit_open_reason is not None:
-            return await self._execute_fallback(
+            return await self._execute_fallback_with_cost(
                 channel_name, prior_messages, target_message, self._jev_circuit_open_reason
             )
 
@@ -625,7 +655,7 @@ class TriageClient:
                 call_cost = float(self.models_cfg.jev.cost_per_call_usd)
                 self.total_cost_usd += call_cost
                 self.uncached_cost_usd += call_cost
-                return item
+                return item, call_cost, call_cost
             except Exception as exc:
                 last_error = exc
                 status = getattr(getattr(exc, "response", None), "status_code", None)
@@ -650,15 +680,17 @@ class TriageClient:
         if not self.models_cfg.jev.auto_fallback_to_openai:
             raise RuntimeError(f"Jev triage failed and auto_fallback_to_openai=False: {reason}") from last_error
 
-        return await self._execute_fallback(channel_name, prior_messages, target_message, reason)
+        return await self._execute_fallback_with_cost(
+            channel_name, prior_messages, target_message, reason
+        )
 
-    async def _execute_fallback(
+    async def _execute_fallback_with_cost(
         self,
         channel_name: str,
         prior_messages: list[ChatMessage],
         target_message: ChatMessage,
         reason: str,
-    ) -> TriageItem:
+    ) -> tuple[TriageItem, float, float]:
         self.fallback_count += 1
         if len(self.fallback_reasons) < 20:
             self.fallback_reasons.append(reason)
@@ -669,11 +701,23 @@ class TriageClient:
             self.fallback_count,
         )
         fb = self._get_fallback()
-        item, cost = await fb.score_message(
+        item, cost, uncached = await fb.score_message_with_cost(
             channel_name, prior_messages, target_message
         )
         self.total_cost_usd += cost
-        self.uncached_cost_usd += max(cost, fb.last_uncached_cost_usd)
+        self.uncached_cost_usd += uncached
+        return item, cost, uncached
+
+    async def _execute_fallback(
+        self,
+        channel_name: str,
+        prior_messages: list[ChatMessage],
+        target_message: ChatMessage,
+        reason: str,
+    ) -> TriageItem:
+        item, _, _ = await self._execute_fallback_with_cost(
+            channel_name, prior_messages, target_message, reason
+        )
         return item
 
     def get_run_metadata(self) -> dict[str, Any]:

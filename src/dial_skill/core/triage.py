@@ -38,6 +38,8 @@ class TriageOutput:
     prompt_tokens_raw: int
     prompt_tokens_slate: int
     triage_backend_used: str
+    triage_cost_usd: float = 0.0
+    triage_uncached_cost_usd: float = 0.0
 
 
 def _uniform_skill_priors() -> dict[SkillName, float]:
@@ -368,20 +370,32 @@ class TriageStage:
         backend_override = self.cfg.ablation.triage_backend_override
         sem = asyncio.Semaphore(8)
 
-        async def _score_one(idx: int, msg: ChatMessage) -> tuple[str, TriageItem]:
+        async def _score_one(idx: int, msg: ChatMessage) -> tuple[str, TriageItem, float, float]:
             prior = messages[max(0, idx - 2) : idx]
             async with sem:
-                item = await self.triage_client.score_message(
-                    channel_name=channel_name,
-                    prior_messages=prior,
-                    target_message=msg,
-                    backend_override=backend_override,
-                )
-            return msg.msg_id, item
+                if hasattr(self.triage_client, "score_message_with_cost"):
+                    item, call_cost, call_uncached = await self.triage_client.score_message_with_cost(
+                        channel_name=channel_name,
+                        prior_messages=prior,
+                        target_message=msg,
+                        backend_override=backend_override,
+                    )
+                else:
+                    item = await self.triage_client.score_message(
+                        channel_name=channel_name,
+                        prior_messages=prior,
+                        target_message=msg,
+                        backend_override=backend_override,
+                    )
+                    call_cost = 0.0
+                    call_uncached = 0.0
+            return msg.msg_id, item, call_cost, call_uncached
 
-        scored_pairs = await asyncio.gather(*(_score_one(i, m) for i, m in enumerate(messages)))
-        annotations: dict[str, TriageItem] = dict(scored_pairs)
-        backends_seen: set[str] = {item.backend for _, item in scored_pairs}
+        scored_rows = await asyncio.gather(*(_score_one(i, m) for i, m in enumerate(messages)))
+        annotations: dict[str, TriageItem] = {mid: item for mid, item, _, _ in scored_rows}
+        backends_seen: set[str] = {item.backend for _, item, _, _ in scored_rows}
+        episode_triage_cost = sum(c for _, _, c, _ in scored_rows)
+        episode_triage_uncached = sum(u for _, _, _, u in scored_rows)
 
         triage_backend_used = (
             "openai_fallback"
@@ -452,4 +466,6 @@ class TriageStage:
             prompt_tokens_raw=prompt_tokens_raw,
             prompt_tokens_slate=0 if short_circuited else estimate_tokens(slate.canonical_text),
             triage_backend_used=triage_backend_used,
+            triage_cost_usd=round(episode_triage_cost, 8),
+            triage_uncached_cost_usd=round(max(episode_triage_cost, episode_triage_uncached), 8),
         )
